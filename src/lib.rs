@@ -24,6 +24,7 @@
 #![warn(missing_docs)]
 
 use std::collections::HashSet;
+use std::fmt::Debug;
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::rc::Rc;
@@ -169,6 +170,12 @@ impl<T> SendRc<T> {
     }
 }
 
+impl<T: Debug> Debug for SendRc<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(&**self, f)
+    }
+}
+
 impl<T> Deref for SendRc<T> {
     type Target = T;
 
@@ -196,6 +203,16 @@ impl<T> Drop for SendRc<T> {
             // breaks unit testing. If we're already panicking, then just leak the Rc.
             panic!("access from wrong thread");
         }
+    }
+}
+
+#[cfg(feature = "deepsize")]
+impl<T> deepsize::DeepSizeOf for SendRc<T>
+where
+    T: deepsize::DeepSizeOf,
+{
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.0.val.deep_size_of_children(context)
     }
 }
 
