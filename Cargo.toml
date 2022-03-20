@@ -1,0 +1,13 @@
+[package]
+name = "send-rc"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hrvoje Nikšić <hniksic@gmail.com>"]
+license = "Apache-2.0/MIT"
+repository = "https://github.com/hniksic/send-rc"
+#documentation = "https://docs.rs/send-rc/"
+#keywords = [...]
+#description = "..."
+
+[dependencies]
+parking_lot = "0.12.0"
