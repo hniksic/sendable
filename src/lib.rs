@@ -110,9 +110,12 @@ impl<T> SendRc<T> {
         // isn't Sync, this is not required for soundness.
 
         let this_thread = Self::current_thread();
-        if self.0.pinned_to.load(Ordering::Relaxed) == this_thread {
-            return; // nothing to do
-        }
+
+        // Temporarily pin the allocation to an impossible ThreadId, thereby disabling its
+        // use while migration is in progress. This prevents clones in the original thread
+        // (if they weren't all transferred) to execute clone() and drop() while we're
+        // running.
+        self.0.pinned_to.store(0, Ordering::Relaxed);
 
         let migration_opt = &mut *self.0.migration.lock();
 
@@ -198,8 +201,11 @@ impl<T> Drop for SendRc<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::SendRc;
     use std::cell::RefCell;
+    use std::mem::ManuallyDrop;
+    use std::sync::{Arc, Barrier};
+
+    use super::SendRc;
 
     #[test]
     fn trivial() {
@@ -326,5 +332,24 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn migrate_half_way() {
+        let barrier = Arc::new(Barrier::new(2));
+        let mut r1 = SendRc::new(RefCell::new(1));
+        let r2 = SendRc::clone(&r1);
+        std::thread::spawn({
+            let barrier = barrier.clone();
+            move || {
+                r1.migrate();
+                barrier.wait();
+                let _ = ManuallyDrop::new(r1); // avoid another panic
+            }
+        });
+        barrier.wait();
+        // not allowed to proceed
+        let _ = r2.clone();
     }
 }
