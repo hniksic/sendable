@@ -16,7 +16,7 @@ from two threads without synchronization.
 
 `SendRc` resolves the above by storing the thread ID of the thread in which it was
 created. Each deref, clone, and drop of the `SendRc` is only allowed from that
-thread. After moving `SendRc` to a different thread, you must invoke `sent()` to mark
-that the value has been migrated. Only after all the clones of a `SendRc` have been
-thus marked will access to the inner value (and to `SendRc::clone()` and
-`SendRc::drop()`) be allowed.
+thread. After moving `SendRc` to a different thread, you must invoke `migrate()` to
+migrate it to the new thread. Only after all the clones of a `SendRc` have been thus
+marked will access to the inner value (and to `SendRc::clone()` and `SendRc::drop()`)
+be allowed.

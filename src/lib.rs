@@ -16,10 +16,10 @@
 //!
 //! `SendRc` resolves the above by storing the thread ID of the thread in which it was
 //! created. Each deref, clone, and drop of the `SendRc` is only allowed from that
-//! thread. After moving `SendRc` to a different thread, you must invoke `sent()` to mark
-//! that the value has been migrated. Only after all the clones of a `SendRc` have been
-//! thus marked will access to the inner value (and to `SendRc::clone()` and
-//! `SendRc::drop()`) be allowed.
+//! thread. After moving `SendRc` to a different thread, you must invoke `migrate()` to
+//! migrate it to the new thread. Only after all the clones of a `SendRc` have been thus
+//! marked will access to the inner value (and to `SendRc::clone()` and `SendRc::drop()`)
+//! be allowed.
 
 #![warn(missing_docs)]
 
@@ -31,15 +31,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
-struct Wrap<T> {
-    allowed_thread: AtomicU64,
-    thread_send: Mutex<Option<Box<ThreadMove>>>,
+struct Inner<T> {
+    // id of thread from which the value can be accessed
+    pinned_to: AtomicU64,
     val: T,
+    // ThreadSend is only needed during migration to other thread -- box it to reduce
+    // memory overhead of wrapping.
+    migration: Mutex<Option<Box<Migration>>>,
 }
 
-struct ThreadMove {
+struct Migration {
     new_thread: u64,
-    sent_clones: HashSet<usize>,
+    migrated_clones: HashSet<usize>,
 }
 
 /// Wrapper around `Rc<T>` that is `Send` if `T` is `Send`.
@@ -50,27 +53,29 @@ struct ThreadMove {
 /// let mut r1 = SendRc::new(RefCell::new(1));
 /// let mut r2 = SendRc::clone(&r1);
 /// std::thread::spawn(move || {
-///     r1.sent();
-///     r2.sent();
+///     r1.migrate();
+///     r2.migrate();
 ///     *r1.borrow_mut() += 1;
 ///     assert_eq!(*r2.borrow(), 2);
 /// })
 /// .join()
 /// .unwrap();
 /// ```
-pub struct SendRc<T>(ManuallyDrop<Rc<Wrap<T>>>);
+pub struct SendRc<T>(ManuallyDrop<Rc<Inner<T>>>);
 
-// Safety: safe because we don't allow access to Rc::clone(), Rc::drop(), and Rc::deref()
-// except from the thread they were migrated in or the thread they were created in.
+// Safety: SendRc can be sent between threads because we prohibit access to Rc::clone(),
+// Rc::drop(), and Rc::deref() except from the thread they are pinned to. After sending
+// them to another thread, you have to call SendRc::migrate() on every one of them, which
+// establishes synchronization between subsequent accesses and previous ones.
 unsafe impl<T> Send for SendRc<T> where T: Send {}
 
 impl<T> SendRc<T> {
     /// Constructs a new SendRc<T>
     pub fn new(val: T) -> Self {
-        SendRc(ManuallyDrop::new(Rc::new(Wrap {
+        SendRc(ManuallyDrop::new(Rc::new(Inner {
             val,
-            allowed_thread: AtomicU64::new(Self::current_thread()),
-            thread_send: Mutex::new(None),
+            pinned_to: AtomicU64::new(Self::current_thread()),
+            migration: Mutex::new(None),
         })))
     }
 
@@ -79,57 +84,85 @@ impl<T> SendRc<T> {
     }
 
     fn check_thread(&self) -> bool {
-        self.0.allowed_thread.load(Ordering::Relaxed) == Self::current_thread()
+        self.0.pinned_to.load(Ordering::Relaxed) == Self::current_thread()
     }
 
     fn check_thread_panic(&self) {
         if !self.check_thread() {
-            panic!("access from wrong thread");
+            panic!("SendRc accessed from incorrect thread; call migrate()");
         }
     }
 
-    /// Mark this SendRc as sent from another thread.
+    /// Migrate this `SendRc` to the current thread.
     ///
-    /// This SendRc and all its clones will remain unusable (deref, drop, and clone will
-    /// panic) until sent() has been called on the remaining clones.
+    /// This must be called on all clones of a `SendRc` after sending them to a thread.
+    /// After a `SendRc` has been sent to another thread, it panics on deref, drop, or
+    /// clone, until `migrate()` has been invoked on all the clones.
     ///
-    /// Calling sent() on clones of the same SendRc from different threads will also
-    /// result in panic.
-    pub fn sent(&mut self) {
+    /// After `migrate()` has been called on all the clones, `SendRc` becomes functional
+    /// again and the underlying value becomes accessible.
+    ///
+    /// Calling `migrate()` on clones of the same `SendRc` from different threads will
+    /// also result in panic.
+    pub fn migrate(&mut self) {
         // Note: we take &mut self although the implementation doesn't need it, in order
         // to assert that this is meant to be invoked on a SendRc we own. Since SendRc
         // isn't Sync, this is not required for soundness.
 
         let this_thread = Self::current_thread();
+        if self.0.pinned_to.load(Ordering::Relaxed) == this_thread {
+            return; // nothing to do
+        }
 
-        // 0 is not a valid ThreadId, so this disables further clones, drops, and derefs
-        // until all clones of this Rc have been sent.
-        self.0.allowed_thread.store(0, Ordering::Relaxed);
-
-        let thread_send = &mut *self.0.thread_send.lock();
+        let migration_opt = &mut *self.0.migration.lock();
 
         let done = {
             // we only care about the strong count because SendRc doesn't expose weak refs
             let clones_total = Rc::strong_count(&self.0);
-            let thread_send = if let Some(thread_send) = thread_send {
-                if thread_send.new_thread != this_thread {
-                    panic!("SendRc::sent() invoked from different threads");
+            let migration = if let Some(migration) = migration_opt {
+                if migration.new_thread != this_thread {
+                    panic!("SendRc::<T>::migrate() invoked on the same T from different threads");
                 }
-                thread_send
+                migration
             } else {
-                thread_send.insert(Box::new(ThreadMove {
+                migration_opt.insert(Box::new(Migration {
                     new_thread: this_thread,
-                    sent_clones: HashSet::with_capacity(clones_total),
+                    migrated_clones: HashSet::with_capacity(clones_total),
                 }))
             };
-            thread_send.sent_clones.insert(self as *const _ as usize);
-            thread_send.sent_clones.len() == clones_total
+            migration.migrated_clones.insert(self as *const _ as usize);
+            migration.migrated_clones.len() == clones_total
         };
 
         if done {
-            *thread_send = None;
-            self.0.allowed_thread.store(this_thread, Ordering::Relaxed);
+            *migration_opt = None;
+            self.0.pinned_to.store(this_thread, Ordering::Relaxed);
         }
+    }
+
+    /// Returns the number of pointers to this allocation.
+    ///
+    /// Panics when invoked from a different thread than the one the `SendRc` was created
+    /// in or migrated to.
+    pub fn strong_count(this: &Self) -> usize {
+        this.check_thread();
+        Rc::strong_count(&this.0)
+    }
+
+    /// Returns a mutable reference into the given `Rc`, if there are no other `Rc`
+    /// pointers to the same allocation.
+    ///
+    /// Panics when invoked from a different thread than the one the `SendRc` was created
+    /// in or migrated to.
+    pub fn get_mut(this: &mut Self) -> Option<&mut T> {
+        this.check_thread();
+        Rc::get_mut(&mut this.0).map(|inner| &mut inner.val)
+    }
+
+    /// Returns true if the two `SendRc`s point to the same allocation.
+    pub fn ptr_eq(this: &mut Self, other: &Self) -> bool {
+        this.check_thread();
+        Rc::ptr_eq(&this.0, &other.0)
     }
 }
 
@@ -181,8 +214,8 @@ mod tests {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
         std::thread::spawn(move || {
-            r1.sent();
-            r2.sent();
+            r1.migrate();
+            r2.migrate();
             *r1.borrow_mut() += 1;
             assert_eq!(*r2.borrow(), 2);
         })
@@ -195,16 +228,16 @@ mod tests {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
         let (mut r1, mut r2) = std::thread::spawn(move || {
-            r1.sent();
-            r2.sent();
+            r1.migrate();
+            r2.migrate();
             *r1.borrow_mut() += 1;
             assert_eq!(*r2.borrow(), 2);
             (r1, r2)
         })
         .join()
         .unwrap();
-        r1.sent();
-        r2.sent();
+        r1.migrate();
+        r2.migrate();
         assert_eq!(*r2.borrow(), 2);
     }
 
@@ -238,15 +271,15 @@ mod tests {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
         let (_r1, r2) = std::thread::spawn(move || {
-            r1.sent();
-            r2.sent();
+            r1.migrate();
+            r2.migrate();
             *r1.borrow_mut() += 1;
             assert_eq!(*r2.borrow(), 2);
             (r1, r2)
         })
         .join()
         .unwrap();
-        // here we must call sent() as well
+        // here we must call migrate() as well
         assert_eq!(*r2.borrow(), 2);
     }
 
@@ -256,8 +289,40 @@ mod tests {
         let mut r1 = SendRc::new(RefCell::new(1));
         let r2 = SendRc::clone(&r1);
         std::thread::spawn(move || {
-            r1.sent();
+            r1.migrate();
             let _ = &*r2;
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn fakse_send() {
+        let mut r1 = SendRc::new(RefCell::new(1));
+        let r2 = SendRc::clone(&r1);
+        std::thread::spawn(move || {
+            // can't call migrate twice on the same value
+            r1.migrate();
+            r1.migrate();
+            let _ = &*r2;
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn migrate_diff_threads() {
+        let mut r1 = SendRc::new(RefCell::new(1));
+        let mut r2 = SendRc::clone(&r1);
+        std::thread::spawn(move || {
+            r1.migrate();
+        })
+        .join()
+        .unwrap();
+        std::thread::spawn(move || {
+            r2.migrate();
         })
         .join()
         .unwrap();
