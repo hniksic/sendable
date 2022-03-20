@@ -81,6 +81,10 @@ impl<T> SendRc<T> {
     }
 
     fn current_thread() -> u64 {
+        // Needed until ThreadId::as_u64() is stabilized.
+
+        // Safety: assumes that ThreadId has the same layout as a u64, which is the case
+        // in the stdlib.
         unsafe { std::mem::transmute(std::thread::current().id()) }
     }
 
@@ -96,15 +100,10 @@ impl<T> SendRc<T> {
 
     /// Migrate this `SendRc` to the current thread.
     ///
-    /// This must be called on all clones of a `SendRc` after sending them to a thread.
-    /// After a `SendRc` has been sent to another thread, it panics on deref, drop, or
-    /// clone, until `migrate()` has been invoked on all the clones.
-    ///
-    /// After `migrate()` has been called on all the clones, `SendRc` becomes functional
-    /// again and the underlying value becomes accessible.
-    ///
-    /// Calling `migrate()` on clones of the same `SendRc` from different threads will
-    /// also result in panic.
+    /// Migration is required after moving a `SendRc` to a thread different than the one
+    /// it has been created in (or one it has been last migrated to).  For the `SendRc` to
+    /// be usable, you must move *all* the `SendRc`s pointing to the same allocation, and
+    /// call `migrate()` on each.
     pub fn migrate(&mut self) {
         // Note: we take &mut self although the implementation doesn't need it, in order
         // to assert that this is meant to be invoked on a SendRc we own. Since SendRc
@@ -124,11 +123,14 @@ impl<T> SendRc<T> {
             // we only care about the strong count because SendRc doesn't expose weak refs
             let clones_total = Rc::strong_count(&self.0);
             let migration = if let Some(migration) = migration_opt {
+                // we're continuing a migration that started with another SendRc - just
+                // check that we're still in the same thread
                 if migration.new_thread != this_thread {
                     panic!("SendRc::<T>::migrate() invoked on the same T from different threads");
                 }
                 migration
             } else {
+                // we're initiating migration for this allocation
                 migration_opt.insert(Box::new(Migration {
                     new_thread: this_thread,
                     migrated_clones: HashSet::with_capacity(clones_total),
@@ -165,7 +167,6 @@ impl<T> SendRc<T> {
 
     /// Returns true if the two `SendRc`s point to the same allocation.
     pub fn ptr_eq(this: &mut Self, other: &Self) -> bool {
-        this.check_thread();
         Rc::ptr_eq(&this.0, &other.0)
     }
 }
@@ -266,7 +267,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn invalid_send() {
+    fn missing_migrate_drop() {
         let r = SendRc::new(RefCell::new(1));
         std::thread::spawn(move || {
             drop(r);
@@ -277,7 +278,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn invalid_use_1() {
+    fn missing_migrate_deref() {
         let r1 = SendRc::new(RefCell::new(1));
         let r2 = SendRc::clone(&r1);
         std::thread::spawn(move || {
@@ -290,7 +291,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn invalid_use_2() {
+    fn missing_second_migrate() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
         let (_r1, r2) = std::thread::spawn(move || {
@@ -308,7 +309,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn incomplete_send() {
+    fn incomplete_migration() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let r2 = SendRc::clone(&r1);
         std::thread::spawn(move || {
@@ -321,11 +322,12 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn fakse_send() {
+    fn faked_migrate() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let r2 = SendRc::clone(&r1);
         std::thread::spawn(move || {
-            // can't call migrate twice on the same value
+            // calling migrate twice on the same value won't fool us into thinking the
+            // SendRc is fully migrated
             r1.migrate();
             r1.migrate();
             let _ = &*r2;
