@@ -39,6 +39,8 @@ struct Inner<T> {
     // id of thread from which the value can be accessed
     pinned_to: AtomicU64,
     val: T,
+    // copy of the Rc's strong count, needed for migrate() to accesss it without having to
+    // synchronize with clone/drop possibly happening in the original thread
     strong_count: AtomicUsize,
     // ThreadSend is only needed during migration to other thread -- box it to reduce
     // memory overhead of wrapping.
@@ -186,6 +188,12 @@ impl<T> Deref for SendRc<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
+        // This is the only place where we can read pinned_to with a Relaxed ordering
+        // because we don't need to worry about a race with migrate(). It's ok to load an
+        // older value of pinned_to because it means migration hasn't finished (because we
+        // haven't participated in it) and it's ok for deref to succeed. If we're called
+        // from some unrelated thread, then this will fail regardless of which value of
+        // pinned_to we observe.
         self.assert_thread_is(None, "dereffed", Relaxed);
         &self.0.val
     }
@@ -193,9 +201,9 @@ impl<T> Deref for SendRc<T> {
 
 impl<T> Clone for SendRc<T> {
     fn clone(&self) -> Self {
-        // Check whether we're in the correct thread both before and after the
-        // clone. Before, so we don't initiate the clone from an incorrect thread, and
-        // after, so that we detect if the migration has started while we were running.
+        // Check whether we're in the correct thread both before and after the clone.
+        // Before, so we don't initiate the clone from an incorrect thread, and after, so
+        // that we detect if the migration has started while we were running.
         let this_thread = Some(Self::current_thread());
         self.assert_thread_is(this_thread, "cloned", SeqCst);
         self.0.strong_count.fetch_add(1, SeqCst);
