@@ -32,6 +32,7 @@ use std::sync::atomic::{
     AtomicU64, AtomicUsize, Ordering,
     Ordering::{Relaxed, SeqCst},
 };
+use std::thread::ThreadId;
 
 use parking_lot::Mutex;
 
@@ -50,6 +51,11 @@ struct Inner<T> {
 struct Migration {
     new_thread: u64,
     migrated_clones: HashSet<usize>,
+    // Count of clones (SendRcs pointing to the same allocation) at the beginning of
+    // migration to the new thread. Calls to clone() and drop() after the migration starts
+    // are detected at run-time and cause a panic and prevent the migration from
+    // completing.
+    clone_count: usize,
 }
 
 /// Wrapper around `Rc<T>` that is `Send` if `T` is `Send`.
@@ -87,11 +93,14 @@ impl<T> SendRc<T> {
         })))
     }
 
+    // Needed until ThreadId::as_u64() is stabilized.
     fn current_thread() -> u64 {
-        // Needed until ThreadId::as_u64() is stabilized.
+        // This is not a guarantee that ThreadId is safe to transmute to u64, but it's
+        // better than nothing.
+        const _: () = assert!(std::mem::size_of::<ThreadId>() == 8);
 
-        // Safety: assumes that ThreadId has the same layout as a u64, which is the case
-        // in the stdlib.
+        // Safety: ThreadId must have layout compatible with that of a u64, which is the
+        // case in the stdlib where it's NonZeroU64.
         unsafe { std::mem::transmute(std::thread::current().id()) }
     }
 
@@ -128,8 +137,6 @@ impl<T> SendRc<T> {
         let migration_opt = &mut *self.0.migration.lock();
 
         let done = {
-            // we only care about the strong count because SendRc doesn't expose weak refs
-            let clones_total = Self::strong_count(self);
             let migration = if let Some(migration) = migration_opt {
                 // we're continuing a migration that started with another SendRc - just
                 // check that we're still in the same thread
@@ -139,13 +146,15 @@ impl<T> SendRc<T> {
                 migration
             } else {
                 // we're initiating migration for this allocation
+                let clone_count = Self::strong_count(self);
                 migration_opt.insert(Box::new(Migration {
                     new_thread: this_thread,
-                    migrated_clones: HashSet::with_capacity(clones_total),
+                    migrated_clones: HashSet::with_capacity(clone_count),
+                    clone_count,
                 }))
             };
             migration.migrated_clones.insert(self as *const _ as usize);
-            migration.migrated_clones.len() == clones_total
+            migration.migrated_clones.len() == migration.clone_count
         };
 
         if done {
@@ -201,37 +210,31 @@ impl<T> Deref for SendRc<T> {
 
 impl<T> Clone for SendRc<T> {
     fn clone(&self) -> Self {
-        // Check whether we're in the correct thread both before and after the clone.
-        // Before, so we don't initiate the clone from an incorrect thread, and after, so
-        // that we detect if the migration has started while we were running.
         let this_thread = Some(Self::current_thread());
-        self.assert_thread_is(this_thread, "cloned", SeqCst);
+        // Increment the count first, so that this clone is taken into account by a
+        // migration that is possibly starting elsewhere.
         self.0.strong_count.fetch_add(1, SeqCst);
-        let clone = SendRc(ManuallyDrop::new(Rc::clone(&self.0)));
         self.assert_thread_is(this_thread, "cloned", SeqCst);
-        clone
+        SendRc(ManuallyDrop::new(Rc::clone(&self.0)))
     }
 }
 
 impl<T> Drop for SendRc<T> {
     fn drop(&mut self) {
         let this_thread = Some(Self::current_thread());
-        let mut broken = self.check_thread_is(this_thread, SeqCst);
-        if !broken {
+        // Instead of panicking immediately, check whether we're in the correct thread and
+        // leak the Rc if we're not. Then panic, but only if we're not already panicking,
+        // because panic-inside-panic aborts the program and breaks unit tests.
+        if self.check_thread_is(this_thread, SeqCst) {
             unsafe {
                 ManuallyDrop::drop(&mut self.0);
             }
-            broken = !self.check_thread_is(this_thread, SeqCst);
-        }
-        // If we have failed the check, don't decrease our copy of the strong count. This
-        // will effectively poison the use of SendRc in another thread because it will
-        // prevent migration from ever finishing.
-        if !broken {
+            // If a migration started while we were executing the drop, it means the
+            // migration works with a strong count that is by one too high and will just
+            // never finish.
             self.0.strong_count.fetch_sub(1, SeqCst);
         } else if !std::thread::panicking() {
-            // Don't panic if we're already panicking, it brings down the program and
-            // breaks unit testing. If we're already panicking, then just leak the Rc.
-            self.assert_thread_is(this_thread, "dropped", SeqCst);
+            panic!("SendRc dropped from incorrect thread; call migrate() first");
         }
     }
 }
