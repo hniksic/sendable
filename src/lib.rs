@@ -259,7 +259,6 @@ where
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::mem::ManuallyDrop;
     use std::sync::{Arc, Barrier};
 
     use parking_lot::Mutex;
@@ -405,7 +404,7 @@ mod tests {
             move || {
                 r1.migrate();
                 barrier.wait();
-                let _ = ManuallyDrop::new(r1); // avoid another panic
+                std::mem::forget(r1); // avoid another panic
             }
         });
         barrier.wait();
