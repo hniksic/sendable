@@ -25,9 +25,8 @@
 
 use std::collections::HashSet;
 use std::fmt::Debug;
-use std::mem::ManuallyDrop;
 use std::ops::Deref;
-use std::rc::Rc;
+use std::ptr::NonNull;
 use std::sync::atomic::{
     AtomicU64, AtomicUsize, Ordering,
     Ordering::{Relaxed, SeqCst},
@@ -74,7 +73,7 @@ struct Migration {
 /// .join()
 /// .unwrap();
 /// ```
-pub struct SendRc<T>(ManuallyDrop<Rc<Inner<T>>>);
+pub struct SendRc<T>(NonNull<Inner<T>>);
 
 // Safety: SendRc can be sent between threads because we prohibit access to Rc::clone(),
 // Rc::drop(), and Rc::deref() except from the thread they are pinned to. After sending
@@ -85,12 +84,25 @@ unsafe impl<T> Send for SendRc<T> where T: Send {}
 impl<T> SendRc<T> {
     /// Constructs a new SendRc<T>
     pub fn new(val: T) -> Self {
-        SendRc(ManuallyDrop::new(Rc::new(Inner {
+        let ptr = Box::into_raw(Box::new(Inner {
             pinned_to: AtomicU64::new(Self::current_thread()),
             val,
             strong_count: AtomicUsize::new(1),
             migration: Mutex::new(None),
-        })))
+        }));
+        // unwrap: we have a valid box, its pointer is not null (rustc eliminates the
+        // check, https://godbolt.org/z/dsYPxxMWo)
+        SendRc(NonNull::new(ptr).unwrap())
+    }
+
+    fn inner(&self) -> &Inner<T> {
+        // Safety: Inner is valid for as long as self
+        unsafe { self.0.as_ref() }
+    }
+
+    fn inner_mut(&mut self) -> &mut Inner<T> {
+        // Safety: Inner is valid for as long as self
+        unsafe { self.0.as_mut() }
     }
 
     // Needed until ThreadId::as_u64() is stabilized.
@@ -106,12 +118,12 @@ impl<T> SendRc<T> {
 
     #[must_use]
     fn is_pinned_to(&self, thread_id: Option<u64>, ordering: Ordering) -> bool {
-        self.0.pinned_to.load(ordering) == thread_id.unwrap_or_else(Self::current_thread)
+        self.inner().pinned_to.load(ordering) == thread_id.unwrap_or_else(Self::current_thread)
     }
 
     fn assert_pinned_to(&self, thread_id: Option<u64>, op: &str, ordering: Ordering) {
         if !self.is_pinned_to(thread_id, ordering) {
-            panic!("SendRc {} from incorrect thread; call migrate() first", op);
+            panic!("SendRc::{}() attempted from incorrect thread; call migrate() first", op);
         }
     }
 
@@ -134,14 +146,15 @@ impl<T> SendRc<T> {
             // the code that traverses SendRcs.
             return;
         }
+        let inner = self.inner();
 
         // Temporarily pin the allocation to an impossible ThreadId, thereby disabling its
         // use while migration is in progress. This prevents clones in the original thread
         // (if they weren't all transferred) to execute clone() and drop() while we're
         // running.
-        self.0.pinned_to.store(0, SeqCst);
+        inner.pinned_to.store(0, SeqCst);
 
-        let migration_opt = &mut *self.0.migration.lock();
+        let migration_opt = &mut *inner.migration.lock();
 
         let done = {
             let migration = if let Some(migration) = migration_opt {
@@ -153,7 +166,7 @@ impl<T> SendRc<T> {
                 migration
             } else {
                 // we're initiating migration for this allocation
-                let clone_count = Self::strong_count(self);
+                let clone_count = self.strong_count_unchecked();
                 migration_opt.insert(Box::new(Migration {
                     new_thread: this_thread,
                     migrated_clones: HashSet::with_capacity(clone_count),
@@ -166,31 +179,56 @@ impl<T> SendRc<T> {
 
         if done {
             *migration_opt = None;
-            self.0.pinned_to.store(this_thread, SeqCst);
+            inner.pinned_to.store(this_thread, SeqCst);
         }
+    }
+
+    fn strong_count_unchecked(&self) -> usize {
+        self.inner().strong_count.load(SeqCst)
     }
 
     /// Returns the number of pointers to this allocation.
     ///
     /// Panics when invoked from a different thread than the one the `SendRc` was created
-    /// in or migrated to.
+    /// in or last migrated to.
     pub fn strong_count(this: &Self) -> usize {
-        this.0.strong_count.load(SeqCst)
+        this.assert_pinned_to(None, "strong_count", Relaxed);
+        this.strong_count_unchecked()
+    }
+
+    /// Returns the inner value, if the `SendRc` has exactly one reference.
+    ///
+    /// Panics when invoked from a different thread than the one the `SendRc` was created
+    /// in or last migrated to.
+    pub fn try_unwrap(this: Self) -> Result<T, Self> {
+        this.assert_pinned_to(None, "try_unwrap", Relaxed);
+        if this.strong_count_unchecked() == 1 {
+            // Safety: refcount is 1, so it's just us, and the pointer was obtained using
+            // Box::into_raw().
+            let inner_box = unsafe { Box::from_raw(this.0.as_ptr()) };
+            Ok(inner_box.val)
+        } else {
+            Err(this)
+        }
     }
 
     /// Returns a mutable reference into the given `SendRc`, if there are no other `SendRc`
     /// pointers to the same allocation.
     ///
     /// Panics when invoked from a different thread than the one the `SendRc` was created
-    /// in or migrated to.
+    /// in or last migrated to.
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
-        this.assert_pinned_to(None, "accessed", Relaxed);
-        Rc::get_mut(&mut this.0).map(|inner| &mut inner.val)
+        this.assert_pinned_to(None, "get_mut", Relaxed);
+        if this.strong_count_unchecked() == 1 {
+            Some(&mut this.inner_mut().val)
+        } else {
+            None
+        }
     }
 
     /// Returns true if the two `SendRc`s point to the same allocation.
-    pub fn ptr_eq(this: &mut Self, other: &Self) -> bool {
-        Rc::ptr_eq(&this.0, &other.0)
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        this.0 == other.0
     }
 }
 
@@ -204,14 +242,13 @@ impl<T> Deref for SendRc<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        // This is the only place where we can read pinned_to with a Relaxed ordering
-        // because we don't need to worry about a race with migrate(). It's ok to load an
-        // older value of pinned_to because it means migration hasn't finished (because we
-        // haven't participated in it) and it's ok for deref to succeed. If we're called
-        // from some unrelated thread, then this will fail regardless of which value of
-        // pinned_to we observe.
-        self.assert_pinned_to(None, "dereffed", Relaxed);
-        &self.0.val
+        // We can read pinned_to with a Relaxed ordering because here we don't need to
+        // worry about a race with migrate(). It's ok to load an older value of pinned_to
+        // because it means migration hasn't finished (because we haven't participated in
+        // it) and it's ok for deref to succeed. If we're called from some unrelated
+        // thread, then this will fail regardless of which value of pinned_to we observe.
+        self.assert_pinned_to(None, "deref", Relaxed);
+        &self.inner().val
     }
 }
 
@@ -220,9 +257,12 @@ impl<T> Clone for SendRc<T> {
         let this_thread = Some(Self::current_thread());
         // Increment the count first, so that this clone is taken into account by a
         // migration that is possibly starting elsewhere.
-        self.0.strong_count.fetch_add(1, SeqCst);
-        self.assert_pinned_to(this_thread, "cloned", SeqCst);
-        SendRc(ManuallyDrop::new(Rc::clone(&self.0)))
+        self.inner().strong_count.fetch_add(1, SeqCst);
+        // Since we don't touch the value, this check is not needed for soundness here,
+        // but to ensure that subsequent deref() of the clone (which fetches pinned_to
+        // with Relaxed ordering) is sound.
+        self.assert_pinned_to(this_thread, "clone", SeqCst);
+        SendRc(self.0)
     }
 }
 
@@ -233,19 +273,19 @@ impl<T> Drop for SendRc<T> {
         // leak the Rc if we're not. Then panic, but only if we're not already panicking,
         // because panic-inside-panic aborts the program and breaks unit tests.
         if self.is_pinned_to(this_thread, SeqCst) {
-            let old_refcnt = Rc::strong_count(&self.0);
-            unsafe {
-                ManuallyDrop::drop(&mut self.0);
-            }
-            // if refcnt was 1, self.0 is no longer valid
-            if old_refcnt > 1 {
-                // If a migration started while we were executing the drop, it means the
-                // migration works with a strong count that is by one too high and will just
-                // never finish.
-                self.0.strong_count.fetch_sub(1, SeqCst);
+            // If a migration starts just before we decrement the count, it means the
+            // migration works with a strong count that is by one too high and will never
+            // finish. If it starts after we decrement the count, it will run to
+            // completion, but in that case there is another SendRc, so old_refcnt won't
+            // drop to 1 for us.
+            let old_refcnt = self.inner().strong_count.fetch_sub(1, SeqCst);
+            if old_refcnt == 1 {
+                unsafe {
+                    std::ptr::drop_in_place(self.0.as_ptr());
+                }
             }
         } else if !std::thread::panicking() {
-            panic!("SendRc dropped from incorrect thread; call migrate() first");
+            panic!("SendRc::drop() attempted from incorrect thread; call migrate() first");
         }
     }
 }
@@ -256,13 +296,14 @@ where
     T: deepsize::DeepSizeOf,
 {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.0.val.deep_size_of_children(context)
+        self.inner().val.deep_size_of_children(context)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::{Arc, Barrier};
 
     use parking_lot::Mutex;
@@ -275,6 +316,45 @@ mod tests {
         let r2 = SendRc::clone(&r1);
         *r1.borrow_mut() = 2;
         assert_eq!(*r2.borrow(), 2);
+    }
+
+    #[test]
+    fn test_drop() {
+        struct Payload(Rc<RefCell<bool>>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                *self.0.as_ref().borrow_mut() = true;
+            }
+        }
+        let make = || {
+            let is_dropped = Rc::new(RefCell::new(false));
+            let payload = Payload(Rc::clone(&is_dropped));
+            (SendRc::new(payload), is_dropped)
+        };
+
+        let (r1, is_dropped) = make();
+        assert!(!*is_dropped.borrow());
+        drop(r1);
+        assert!(*is_dropped.borrow());
+
+        let (r1, is_dropped) = make();
+        let r2 = SendRc::clone(&r1);
+        assert!(!*is_dropped.borrow());
+        drop(r1);
+        assert!(!*is_dropped.borrow());
+        drop(r2);
+        assert!(*is_dropped.borrow());
+
+        let (r1, is_dropped) = make();
+        let r2 = SendRc::clone(&r1);
+        let r3 = SendRc::clone(&r1);
+        assert!(!*is_dropped.borrow());
+        drop(r1);
+        assert!(!*is_dropped.borrow());
+        drop(r2);
+        assert!(!*is_dropped.borrow());
+        drop(r3);
+        assert!(*is_dropped.borrow());
     }
 
     #[test]
