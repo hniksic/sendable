@@ -127,6 +127,13 @@ impl<T> SendRc<T> {
         // isn't Sync, this is not required for soundness.
 
         let this_thread = Self::current_thread();
+        if self.is_pinned_to(Some(this_thread), Relaxed) {
+            // Allow a call to migrate() from the pinned thread after the migration is
+            // successfully finished. (Multiple calls to migrate() by the same SendRc are
+            // also allowed during migration, since we use a HashSet.) This allows simpler
+            // the code that traverses SendRcs.
+            return;
+        }
 
         // Temporarily pin the allocation to an impossible ThreadId, thereby disabling its
         // use while migration is in progress. This prevents clones in the original thread
