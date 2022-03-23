@@ -233,13 +233,17 @@ impl<T> Drop for SendRc<T> {
         // leak the Rc if we're not. Then panic, but only if we're not already panicking,
         // because panic-inside-panic aborts the program and breaks unit tests.
         if self.is_pinned_to(this_thread, SeqCst) {
+            let old_refcnt = Rc::strong_count(&self.0);
             unsafe {
                 ManuallyDrop::drop(&mut self.0);
             }
-            // If a migration started while we were executing the drop, it means the
-            // migration works with a strong count that is by one too high and will just
-            // never finish.
-            self.0.strong_count.fetch_sub(1, SeqCst);
+            // if refcnt was 1, self.0 is no longer valid
+            if old_refcnt > 1 {
+                // If a migration started while we were executing the drop, it means the
+                // migration works with a strong count that is by one too high and will just
+                // never finish.
+                self.0.strong_count.fetch_sub(1, SeqCst);
+            }
         } else if !std::thread::panicking() {
             panic!("SendRc dropped from incorrect thread; call migrate() first");
         }
