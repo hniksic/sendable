@@ -262,6 +262,8 @@ mod tests {
     use std::mem::ManuallyDrop;
     use std::sync::{Arc, Barrier};
 
+    use parking_lot::Mutex;
+
     use super::SendRc;
 
     #[test]
@@ -409,5 +411,27 @@ mod tests {
         barrier.wait();
         // not allowed to proceed
         let _ = r2.clone();
+    }
+
+    #[test]
+    fn incomplete_migration_use_migrated_ref() {
+        let mut r1 = SendRc::new(RefCell::new(1));
+        let r2 = SendRc::clone(&r1);
+        let state = Arc::new(Mutex::new(0));
+        let result = std::thread::spawn({
+            let state = Arc::clone(&state);
+            move || {
+                *state.lock() = 1;
+                r1.migrate();
+                *state.lock() = 2;
+                let _ = &*r1;
+                *state.lock() = 3;
+                drop(r2);
+                *state.lock() = 4;
+            }
+        })
+        .join();
+        assert!(result.is_err());
+        assert_eq!(*state.lock(), 2);
     }
 }
