@@ -105,12 +105,12 @@ impl<T> SendRc<T> {
     }
 
     #[must_use]
-    fn check_thread_is(&self, thread_id: Option<u64>, ordering: Ordering) -> bool {
+    fn is_pinned_to(&self, thread_id: Option<u64>, ordering: Ordering) -> bool {
         self.0.pinned_to.load(ordering) == thread_id.unwrap_or_else(Self::current_thread)
     }
 
-    fn assert_thread_is(&self, thread_id: Option<u64>, op: &str, ordering: Ordering) {
-        if !self.check_thread_is(thread_id, ordering) {
+    fn assert_pinned_to(&self, thread_id: Option<u64>, op: &str, ordering: Ordering) {
+        if !self.is_pinned_to(thread_id, ordering) {
             panic!("SendRc {} from incorrect thread; call migrate() first", op);
         }
     }
@@ -177,7 +177,7 @@ impl<T> SendRc<T> {
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or migrated to.
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
-        this.assert_thread_is(None, "accessed", Relaxed);
+        this.assert_pinned_to(None, "accessed", Relaxed);
         Rc::get_mut(&mut this.0).map(|inner| &mut inner.val)
     }
 
@@ -203,7 +203,7 @@ impl<T> Deref for SendRc<T> {
         // haven't participated in it) and it's ok for deref to succeed. If we're called
         // from some unrelated thread, then this will fail regardless of which value of
         // pinned_to we observe.
-        self.assert_thread_is(None, "dereffed", Relaxed);
+        self.assert_pinned_to(None, "dereffed", Relaxed);
         &self.0.val
     }
 }
@@ -214,7 +214,7 @@ impl<T> Clone for SendRc<T> {
         // Increment the count first, so that this clone is taken into account by a
         // migration that is possibly starting elsewhere.
         self.0.strong_count.fetch_add(1, SeqCst);
-        self.assert_thread_is(this_thread, "cloned", SeqCst);
+        self.assert_pinned_to(this_thread, "cloned", SeqCst);
         SendRc(ManuallyDrop::new(Rc::clone(&self.0)))
     }
 }
@@ -225,7 +225,7 @@ impl<T> Drop for SendRc<T> {
         // Instead of panicking immediately, check whether we're in the correct thread and
         // leak the Rc if we're not. Then panic, but only if we're not already panicking,
         // because panic-inside-panic aborts the program and breaks unit tests.
-        if self.check_thread_is(this_thread, SeqCst) {
+        if self.is_pinned_to(this_thread, SeqCst) {
             unsafe {
                 ManuallyDrop::drop(&mut self.0);
             }
