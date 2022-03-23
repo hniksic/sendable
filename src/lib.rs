@@ -59,6 +59,8 @@ struct Migration {
     clone_count: usize,
 }
 
+static ID_NEXT: AtomicUsize = AtomicUsize::new(0);
+
 /// Wrapper around `Rc<T>` that is `Send` if `T` is `Send`.
 ///
 /// ```
@@ -75,7 +77,12 @@ struct Migration {
 /// .join()
 /// .unwrap();
 /// ```
-pub struct SendRc<T>(NonNull<Inner<T>>);
+pub struct SendRc<T> {
+    ptr: NonNull<Inner<T>>,
+    // associate an non-changing id with each pointer so that migrate() can track how many
+    // have participated in migration
+    id: usize,
+}
 
 // Safety: SendRc can be sent between threads because we prohibit access to Rc::clone(),
 // Rc::drop(), and Rc::deref() except from the thread they are pinned to. After sending
@@ -92,19 +99,26 @@ impl<T> SendRc<T> {
             strong_count: AtomicUsize::new(1),
             migration: Mutex::new(None),
         }));
-        // unwrap: we have a valid box, its pointer is not null (rustc eliminates the
-        // check, https://godbolt.org/z/dsYPxxMWo)
-        SendRc(NonNull::new(ptr).unwrap())
+        SendRc::from_ptr(ptr)
+    }
+
+    fn from_ptr(ptr: *mut Inner<T>) -> Self {
+        SendRc {
+            // unwrap: we have a valid box, its pointer is not null (rustc eliminates the
+            // check, https://godbolt.org/z/dsYPxxMWo)
+            ptr: NonNull::new(ptr).unwrap(),
+            id: ID_NEXT.fetch_add(1, Relaxed),
+        }
     }
 
     fn inner(&self) -> &Inner<T> {
         // Safety: Inner is valid for as long as self
-        unsafe { self.0.as_ref() }
+        unsafe { self.ptr.as_ref() }
     }
 
     fn inner_mut(&mut self) -> &mut Inner<T> {
         // Safety: Inner is valid for as long as self
-        unsafe { self.0.as_mut() }
+        unsafe { self.ptr.as_mut() }
     }
 
     // Needed until ThreadId::as_u64() is stabilized.
@@ -178,7 +192,7 @@ impl<T> SendRc<T> {
                     clone_count,
                 }))
             };
-            migration.migrated_clones.insert(self as *const _ as usize);
+            migration.migrated_clones.insert(self.id);
             migration.migrated_clones.len() == migration.clone_count
         };
 
@@ -210,7 +224,7 @@ impl<T> SendRc<T> {
         if this.strong_count_unchecked() == 1 {
             // Safety: refcount is 1, so it's just us, and the pointer was obtained using
             // Box::into_raw().
-            let inner_box = unsafe { Box::from_raw(this.0.as_ptr()) };
+            let inner_box = unsafe { Box::from_raw(this.ptr.as_ptr()) };
             Ok(inner_box.val)
         } else {
             Err(this)
@@ -233,7 +247,7 @@ impl<T> SendRc<T> {
 
     /// Returns true if the two `SendRc`s point to the same allocation.
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
-        this.0 == other.0
+        this.ptr == other.ptr
     }
 }
 
@@ -273,7 +287,7 @@ impl<T> Clone for SendRc<T> {
         // but to ensure that subsequent deref() of the clone (which fetches pinned_to
         // with Relaxed ordering) is sound.
         self.assert_pinned_to(this_thread, "clone", SeqCst);
-        SendRc(self.0)
+        SendRc::from_ptr(self.ptr.as_ptr())
     }
 }
 
@@ -292,7 +306,7 @@ impl<T> Drop for SendRc<T> {
             let old_refcnt = self.inner().strong_count.fetch_sub(1, SeqCst);
             if old_refcnt == 1 {
                 unsafe {
-                    std::ptr::drop_in_place(self.0.as_ptr());
+                    std::ptr::drop_in_place(self.ptr.as_ptr());
                 }
             }
         } else if !std::thread::panicking() {
