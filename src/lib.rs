@@ -23,8 +23,10 @@
 
 #![warn(missing_docs)]
 
+use std::borrow::Borrow;
 use std::collections::HashSet;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
+use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::atomic::{
@@ -123,7 +125,10 @@ impl<T> SendRc<T> {
 
     fn assert_pinned_to(&self, thread_id: Option<u64>, op: &str, ordering: Ordering) {
         if !self.is_pinned_to(thread_id, ordering) {
-            panic!("SendRc::{}() attempted from incorrect thread; call migrate() first", op);
+            panic!(
+                "SendRc::{}() from different thread; call migrate() first",
+                op
+            );
         }
     }
 
@@ -161,7 +166,7 @@ impl<T> SendRc<T> {
                 // we're continuing a migration that started with another SendRc - just
                 // check that we're still in the same thread
                 if migration.new_thread != this_thread {
-                    panic!("SendRc::<T>::migrate() invoked on the same T from different threads");
+                    panic!("SendRc::migrate() on the same allocation from different threads");
                 }
                 migration
             } else {
@@ -232,6 +237,12 @@ impl<T> SendRc<T> {
     }
 }
 
+impl<T: Display> Display for SendRc<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&**self, f)
+    }
+}
+
 impl<T: Debug> Debug for SendRc<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(&**self, f)
@@ -287,6 +298,51 @@ impl<T> Drop for SendRc<T> {
         } else if !std::thread::panicking() {
             panic!("SendRc::drop() attempted from incorrect thread; call migrate() first");
         }
+    }
+}
+
+impl<T> AsRef<T> for SendRc<T> {
+    fn as_ref(&self) -> &T {
+        &**self
+    }
+}
+
+impl<T> Borrow<T> for SendRc<T> {
+    fn borrow(&self) -> &T {
+        &**self
+    }
+}
+
+impl<T: Default> Default for SendRc<T> {
+    fn default() -> SendRc<T> {
+        SendRc::new(Default::default())
+    }
+}
+
+impl<T: Eq> Eq for SendRc<T> {}
+
+impl<T: PartialEq> PartialEq for SendRc<T> {
+    #[inline]
+    fn eq(&self, other: &SendRc<T>) -> bool {
+        SendRc::ptr_eq(self, other) || **self == **other
+    }
+}
+
+impl<T: PartialOrd> PartialOrd for SendRc<T> {
+    fn partial_cmp(&self, other: &SendRc<T>) -> Option<std::cmp::Ordering> {
+        (**self).partial_cmp(&**other)
+    }
+}
+
+impl<T: Ord> Ord for SendRc<T> {
+    fn cmp(&self, other: &SendRc<T>) -> std::cmp::Ordering {
+        (**self).cmp(&**other)
+    }
+}
+
+impl<T: Hash> Hash for SendRc<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (**self).hash(state);
     }
 }
 
