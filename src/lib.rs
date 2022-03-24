@@ -15,46 +15,28 @@
 //! synchronization.
 //!
 //! `SendRc` resolves by pinning the underlying allocation to a particular thread. You can
-//! move `SendRc` to a different thread, but if you try to access the allocation, or to
-//! clone or drop the `SendRc`, you get a panic. Instead, you must first _migrate_ the
-//! `SendRc`s to the new thread by invoking `migrate()` on all the values, and only after
-//! that will the values become usable.
+//! move `SendRc` to a different thread, but if you try to deref, clone, or drop it, you
+//! get a panic. Instead, you must first disable hte `SendRc`s in the original thread, and
+//! then reenable them in the new thread, after which they become usable again.
 
 #![warn(missing_docs)]
 
 use std::borrow::Borrow;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::sync::atomic::{
-    AtomicU64, AtomicUsize, Ordering,
-    Ordering::{Relaxed, SeqCst},
-};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread::ThreadId;
-
-use parking_lot::Mutex;
 
 struct Inner<T> {
     // id of thread from which the value can be accessed
     pinned_to: AtomicU64,
     val: T,
     // the reference count
-    strong_count: AtomicUsize,
-    // Migration is only needed while moving to the other thread, which happens
-    // rarely. Boxing it reduces memory overhead of this struct compared to just `T`.
-    migration: Mutex<Option<Box<Migration>>>,
-}
-
-struct Migration {
-    new_thread: u64,
-    migrated_clones: HashSet<usize>,
-    // Count of clones (SendRcs pointing to the same allocation) at the beginning of
-    // migration to the new thread. Calls to clone() and drop() after the migration starts
-    // are detected at run-time and cause a panic and prevent the migration from
-    // completing.
-    clone_count: usize,
+    strong_count: Cell<usize>,
 }
 
 static ID_NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -67,24 +49,28 @@ static ID_NEXT: AtomicUsize = AtomicUsize::new(0);
 /// `RefCell` inside.
 ///
 /// After a `SendRc` is created, it is pinned to the current thread, and usable only in
-/// that thread. When sending a `SendRc` to different thread, you must send all the
-/// `SendRc`s that point to the same allocation, and invoke `migrate()` on each. Then they
-/// become usable in the new thread, and only there. They may then be sent to a different
-/// thread using the same process.
+/// that thread. When sending a `SendRc` to different thread, you must first disable all
+/// the `SendRc`s that point to the same allocation, then send them, and finally reenable
+/// them in the new thread. They may again be sent to a different thread using the same
+/// process.
 ///
 /// ```
 /// # use std::cell::RefCell;
 /// # use send_rc::SendRc;
 /// let mut r1 = SendRc::new(RefCell::new(1));
 /// let mut r2 = SendRc::clone(&r1);
-/// // move both pointers to a new thread
+/// let mut r3 = SendRc::clone(&r1);
+/// let mut send = r1.pre_send_disable_all([&mut r2, &mut r3]);
+/// // move the pointers to a new thread
 /// std::thread::spawn(move || {
-///     // r1 and r2 are not usable before migration
-///     r1.migrate();
-///     r2.migrate();
-///     // now they can be used normally
+///     // pointers are unusable here
+///     send.enable(&mut r1);
+///     // r1 is usable here
+///     send.enable_many([&mut r2, &mut r3]);
+///     // all three can now be used normally
 ///     *r1.borrow_mut() += 1;
 ///     assert_eq!(*r2.borrow(), 2);
+///     assert_eq!(*r3.borrow(), 2);
 /// })
 /// .join()
 /// .unwrap();
@@ -92,14 +78,12 @@ static ID_NEXT: AtomicUsize = AtomicUsize::new(0);
 ///
 /// Compared to `Rc`, tradeoffs are:
 ///
-/// * `deref()` requires a relaxed atomic atomic to check that we're accessing the contents from
-///   the correct thread.
-/// * `clone()` and `drop()` require a seqcst atomic load to check that we're in the correct
-///   thread.
+/// * `deref()`, `clone()`, and `drop()` requires a check that the pointer is not disabled,
+///    and a relaxed atomic load to check that we're accessing it from the correct thread.
 /// * takes up two machine words.
 pub struct SendRc<T> {
     ptr: NonNull<Inner<T>>,
-    // associate an non-changing id with each pointer so that migrate() can track how many
+    // associate an non-changing id with each pointer so that we can track how many
     // have participated in migration
     id: usize,
 }
@@ -113,14 +97,14 @@ unsafe impl<T> Send for SendRc<T> where T: Send {}
 impl<T> SendRc<T> {
     /// Constructs a new `SendRc<T>`.
     ///
-    /// The newly created `SendRc` is only usable from the current thread. After sending
-    /// it to another thread, you must call `migrate()`.
+    /// The newly created `SendRc` is only usable from the current thread. To send it to
+    /// another thread, you must call `pre_send()`, disable it, and re-enable it in the
+    /// new thread.
     pub fn new(val: T) -> Self {
         let ptr = Box::into_raw(Box::new(Inner {
-            pinned_to: AtomicU64::new(Self::current_thread()),
+            pinned_to: AtomicU64::new(current_thread()),
             val,
-            strong_count: AtomicUsize::new(1),
-            migration: Mutex::new(None),
+            strong_count: Cell::new(1),
         }));
         SendRc::from_inner_ptr(ptr)
     }
@@ -130,7 +114,7 @@ impl<T> SendRc<T> {
             // unwrap: we have a valid box, its pointer is not null (rustc eliminates the
             // check, https://godbolt.org/z/dsYPxxMWo)
             ptr: NonNull::new(ptr).unwrap(),
-            id: ID_NEXT.fetch_add(1, Relaxed),
+            id: ID_NEXT.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -144,89 +128,53 @@ impl<T> SendRc<T> {
         unsafe { self.ptr.as_mut() }
     }
 
-    // Needed until ThreadId::as_u64() is stabilized.
-    fn current_thread() -> u64 {
-        // This is not a guarantee that ThreadId is safe to transmute to u64, but it's
-        // better than nothing.
-        const _: () = assert!(std::mem::size_of::<ThreadId>() == 8);
-
-        // Safety: ThreadId must have layout compatible with that of a u64, which is the
-        // case in the stdlib where it's NonZeroU64.
-        unsafe { std::mem::transmute(std::thread::current().id()) }
+    #[inline]
+    fn check_pinned(&self) -> Result<(), &'static str> {
+        if self.ptr == NonNull::dangling() {
+            return Err("attempt to use disabled SendRc");
+        }
+        if self.inner().pinned_to.load(Ordering::Relaxed) != current_thread() {
+            return Err("attempt to use SendRc from different thread; call pre_send() first");
+        }
+        Ok(())
     }
 
-    #[must_use]
-    fn is_pinned_to(&self, thread_id: Option<u64>, ordering: Ordering) -> bool {
-        self.inner().pinned_to.load(ordering) == thread_id.unwrap_or_else(Self::current_thread)
-    }
-
-    fn assert_pinned_to(&self, thread_id: Option<u64>, op: &str, ordering: Ordering) {
-        if !self.is_pinned_to(thread_id, ordering) {
-            panic!(
-                "SendRc::{}() from different thread; call migrate() first",
-                op
-            );
+    fn assert_pinned(&self, op: &str) {
+        if let Err(msg) = self.check_pinned() {
+            panic!("SendRc::{op}: {msg}");
         }
     }
 
-    /// Migrate this `SendRc` to the current thread.
+    /// Prepare to send this `SendRc` to the current thread.
     ///
-    /// Migration is required after moving a `SendRc` to a thread different than the one
-    /// it has been created in (or one it has been last migrated to).  For the `SendRc` to
-    /// be usable, you must move *all* the `SendRc`s pointing to the same allocation, and
-    /// call `migrate()` on each.
-    pub fn migrate(&mut self) {
-        // Note: we take &mut self although the implementation doesn't need it, in order
-        // to assert that this is meant to be invoked on a SendRc we own. Since SendRc
-        // isn't Sync, this is not required for soundness.
-
-        let this_thread = Self::current_thread();
-        if self.is_pinned_to(Some(this_thread), Relaxed) {
-            // Allow a call to migrate() from the pinned thread after the migration is
-            // successfully finished. (Multiple calls to migrate() by the same SendRc are
-            // also allowed during migration, since we use a HashSet.) This allows simpler
-            // the code that traverses SendRcs.
-            return;
-        }
-        let inner = self.inner();
-
-        // Temporarily pin the allocation to an impossible ThreadId, thereby disabling its
-        // use while migration is in progress. This prevents clones in the original thread
-        // (if they weren't all transferred) to execute clone() and drop() while we're
-        // running.
-        inner.pinned_to.store(0, SeqCst);
-
-        let migration_opt = &mut *inner.migration.lock();
-
-        let done = {
-            let migration = if let Some(migration) = migration_opt {
-                // we're continuing a migration that started with another SendRc - just
-                // check that we're still in the same thread
-                if migration.new_thread != this_thread {
-                    panic!("SendRc::migrate() on the same allocation from different threads");
-                }
-                migration
-            } else {
-                // we're initiating migration for this allocation
-                let clone_count = self.strong_count_unchecked();
-                migration_opt.insert(Box::new(Migration {
-                    new_thread: this_thread,
-                    migrated_clones: HashSet::with_capacity(clone_count),
-                    clone_count,
-                }))
-            };
-            migration.migrated_clones.insert(self.id);
-            migration.migrated_clones.len() == migration.clone_count
+    /// Before moving a `SendRc` to a different thread, you must disable all pointers to this
+    /// allocation by calling `pre_send()` and invoking `disable()` on all of them. After
+    /// sending the `SendRc`s and the `PreSend` to a different thread, you can enable the
+    /// pointers by calling `PostSend::enable()`.
+    pub fn pre_send(&mut self) -> PreSend<T> {
+        self.assert_pinned("pre_send");
+        let mut pre_send = PreSend {
+            ptr: self.ptr,
+            disabled: HashSet::new(),
         };
-
-        if done {
-            *migration_opt = None;
-            inner.pinned_to.store(this_thread, SeqCst);
-        }
+        pre_send.disable(self);
+        pre_send
     }
 
-    fn strong_count_unchecked(&self) -> usize {
-        self.inner().strong_count.load(SeqCst)
+    /// Prepare to send this and other `SendRc`s to a different thread.
+    ///
+    /// Equivalent to calling `pre_send()`, disabling the provided `SendRc`s, and invoking
+    /// `PreSend::ready()`.
+    pub fn pre_send_disable_all<'a>(
+        &mut self,
+        everyone: impl IntoIterator<Item = &'a mut Self>,
+    ) -> PostSend<T>
+    where
+        T: 'a,
+    {
+        let mut send = self.pre_send();
+        send.disable_many(everyone);
+        send.ready()
     }
 
     /// Returns the number of pointers to this allocation.
@@ -234,8 +182,8 @@ impl<T> SendRc<T> {
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last migrated to.
     pub fn strong_count(this: &Self) -> usize {
-        this.assert_pinned_to(None, "strong_count", Relaxed);
-        this.strong_count_unchecked()
+        this.assert_pinned("strong_count");
+        this.inner().strong_count.get()
     }
 
     /// Returns the inner value, if the `SendRc` has exactly one reference.
@@ -243,8 +191,8 @@ impl<T> SendRc<T> {
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last migrated to.
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
-        this.assert_pinned_to(None, "try_unwrap", Relaxed);
-        if this.strong_count_unchecked() == 1 {
+        this.assert_pinned("try_unwrap");
+        if this.inner().strong_count.get() == 1 {
             // Safety: refcount is 1, so it's just us, and the pointer was obtained using
             // Box::into_raw().
             let inner_box = unsafe { Box::from_raw(this.ptr.as_ptr()) };
@@ -260,8 +208,8 @@ impl<T> SendRc<T> {
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last migrated to.
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
-        this.assert_pinned_to(None, "get_mut", Relaxed);
-        if this.strong_count_unchecked() == 1 {
+        this.assert_pinned("get_mut");
+        if this.inner().strong_count.get() == 1 {
             Some(&mut this.inner_mut().val)
         } else {
             None
@@ -271,6 +219,141 @@ impl<T> SendRc<T> {
     /// Returns true if the two `SendRc`s point to the same allocation.
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
         this.ptr == other.ptr
+    }
+}
+
+// Temporary workaround until ThreadId::as_u64() is stabilized.
+fn current_thread() -> u64 {
+    // This is not a guarantee that ThreadId is safe to transmute to u64, but it's
+    // better than nothing.
+    const _: () = assert!(std::mem::size_of::<ThreadId>() == 8);
+
+    // Safety: ThreadId must have layout compatible with that of a u64, which is the
+    // case in the stdlib where it's NonZeroU64.
+    unsafe { std::mem::transmute(std::thread::current().id()) }
+}
+
+/// Handle for disabling the `SendRc`s before they are sent to another thread.
+pub struct PreSend<T> {
+    ptr: NonNull<Inner<T>>,
+    disabled: HashSet<usize>,
+}
+
+impl<T> PreSend<T> {
+    /// Make `send_rc` temporarily unusable so it can be sent to another thread.
+    ///
+    /// After this call it is no longer possible to deref, clone, or drop this `SendRc`.
+    ///
+    /// You must call `disable()` on all `SendRc`s pointing to an allocation before moving
+    /// them to another thread.
+    pub fn disable(&mut self, send_rc: &mut SendRc<T>) {
+        self.disabled.insert(send_rc.id);
+        send_rc.ptr = NonNull::dangling();
+    }
+
+    /// Make multiple `SendRc`s temporarily unusable as if with `disable()`.
+    pub fn disable_many<'a>(&mut self, many: impl IntoIterator<Item = &'a mut SendRc<T>>)
+    where
+        T: 'a,
+    {
+        for send_rc in many {
+            self.disable(send_rc);
+        }
+    }
+
+    /// Returns true if all the `SendRc`s have been disabled and `ready()` can be called.
+    pub fn all_disabled(&self) -> bool {
+        let inner = unsafe { &*self.ptr.as_ptr() };
+        self.disabled.len() == inner.strong_count.get()
+    }
+
+    /// Returns a handle that can be sent to another thread to re-enable the `SendRc`s
+    /// there.
+    ///
+    /// Panics if `all_disabled()` would return false.
+    pub fn ready(self) -> PostSend<T> {
+        if !self.all_disabled() {
+            panic!("ready() called before all SendRcs have been disabled");
+        }
+        PostSend {
+            ptr: self.ptr,
+            enabled: HashSet::new(),
+            expected: self.disabled.len(),
+            prev_thread: current_thread(),
+        }
+    }
+}
+
+/// Handle for enabling the `SendRc`s after they are sent to another thread.
+#[must_use]
+pub struct PostSend<T> {
+    ptr: NonNull<Inner<T>>,
+    enabled: HashSet<usize>,
+    expected: usize,
+    prev_thread: u64,
+}
+
+unsafe impl<T> Send for PostSend<T> where T: Send {}
+
+impl<T> PostSend<T> {
+    /// Make `send_rc` usable again after having moved it to a new thread.
+    pub fn enable(&mut self, send_rc: &mut SendRc<T>) {
+        let inner = unsafe { &*self.ptr.as_ptr() };
+        let old_pinned_to = inner.pinned_to.swap(current_thread(), Ordering::SeqCst);
+        if old_pinned_to != self.prev_thread && old_pinned_to != current_thread() {
+            panic!("PostSend::enable() called from multiple threads");
+        }
+        if send_rc.ptr != NonNull::dangling() {
+            if self.enabled.contains(&send_rc.id) {
+                // make calling enable() twice a no-op
+                return;
+            }
+            // attempted "enable" of a new SendRc, possibly obtained by cloning an already
+            // enabled one
+            panic!("PostSend::enable() called on a non-disabled SendRc");
+        }
+        send_rc.ptr = self.ptr;
+        self.enabled.insert(send_rc.id);
+    }
+
+    /// Make multiple `SendRc`s usable again as if with `enable()`.
+    pub fn enable_many<'a>(&mut self, many: impl IntoIterator<Item = &'a mut SendRc<T>>)
+    where
+        T: 'a,
+    {
+        for send_rc in many {
+            self.enable(send_rc);
+        }
+    }
+
+    /// Returns true if all the `SendRc`s have been enabled.
+    ///
+    /// Useful for asserting that the post-send traversal hasn't missed a `SendRc`
+    /// somewhere.
+    pub fn all_enabled(&self) -> bool {
+        self.enabled.len() == self.expected
+    }
+}
+
+/// Common trait for PreSend::disable() and AfterSend::enable(), allowing a common
+/// implementation of visiting the `SendRc`s.
+pub trait SendVisit<T> {
+    /// Visit the `SendRc`.
+    ///
+    /// When invoked on `PreSend`, this calls `disable()`.
+    /// When invoked on `PostSend`, this calls `enable()`.
+    fn visit(&mut self, send_rc: &mut SendRc<T>);
+}
+
+impl<T> SendVisit<T> for PreSend<T> {
+    fn visit(&mut self, send_rc: &mut SendRc<T>) {
+        self.disable(send_rc);
+    }
+}
+
+impl<T> SendVisit<T> for PostSend<T> {
+    fn visit(&mut self, send_rc: &mut SendRc<T>) {
+        self.enable(send_rc);
     }
 }
 
@@ -290,50 +373,42 @@ impl<T> Deref for SendRc<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        // We can read pinned_to with a Relaxed ordering because here we don't need to
-        // worry about a race with migrate(). It's ok to load an older value of pinned_to
-        // because it means migration hasn't finished (because we haven't participated in
-        // it) and it's ok for deref to succeed. If we're called from some unrelated
-        // thread, then this will fail regardless of which value of pinned_to we observe.
-        self.assert_pinned_to(None, "deref", Relaxed);
+        self.assert_pinned("deref");
         &self.inner().val
     }
 }
 
 impl<T> Clone for SendRc<T> {
     fn clone(&self) -> Self {
-        let this_thread = Some(Self::current_thread());
-        // Increment the count first, so that this clone is taken into account by a
-        // migration that is possibly starting elsewhere.
-        self.inner().strong_count.fetch_add(1, SeqCst);
-        // Since we don't touch the value, this check is not needed for soundness here,
-        // but to ensure that subsequent deref() of the clone (which fetches pinned_to
-        // with Relaxed ordering) is sound.
-        self.assert_pinned_to(this_thread, "clone", SeqCst);
+        self.assert_pinned("clone");
+        self.inner()
+            .strong_count
+            .set(self.inner().strong_count.get() + 1);
         SendRc::from_inner_ptr(self.ptr.as_ptr())
     }
 }
 
 impl<T> Drop for SendRc<T> {
     fn drop(&mut self) {
-        let this_thread = Some(Self::current_thread());
         // Instead of panicking immediately, check whether we're in the correct thread and
         // leak the value if we're not. Then panic, but only if we're not already
         // panicking, because panic-inside-panic aborts the program and breaks unit tests.
-        if self.is_pinned_to(this_thread, SeqCst) {
-            // If a migration starts just before we decrement the count, it means the
-            // migration works with a strong count that is by one too high and will never
-            // finish. If it starts after we decrement the count, it will run to
-            // completion, but in that case there is another SendRc, so old_refcnt won't
-            // drop to 1 for us.
-            let old_refcnt = self.inner().strong_count.fetch_sub(1, SeqCst);
-            if old_refcnt == 1 {
-                unsafe {
-                    std::ptr::drop_in_place(self.ptr.as_ptr());
+        match self.check_pinned() {
+            Ok(()) => {
+                let refcnt = self.inner().strong_count.get();
+                if refcnt == 1 {
+                    unsafe {
+                        std::ptr::drop_in_place(self.ptr.as_ptr());
+                    }
+                } else {
+                    self.inner().strong_count.set(refcnt - 1);
                 }
             }
-        } else if !std::thread::panicking() {
-            panic!("SendRc::drop() attempted from incorrect thread; call migrate() first");
+            Err(msg) => {
+                if !std::thread::panicking() {
+                    panic!("drop: {msg}");
+                }
+            }
         }
     }
 }
@@ -396,7 +471,7 @@ where
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::{Arc, Barrier};
+    use std::sync::Arc;
 
     use parking_lot::Mutex;
 
@@ -453,9 +528,10 @@ mod tests {
     fn ok_send() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
+        let mut send = r1.pre_send_disable_all([&mut r2]);
+
         std::thread::spawn(move || {
-            r1.migrate();
-            r2.migrate();
+            send.enable_many([&mut r1, &mut r2]);
             *r1.borrow_mut() += 1;
             assert_eq!(*r2.borrow(), 2);
         })
@@ -467,23 +543,25 @@ mod tests {
     fn send_and_return() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
-        let (mut r1, mut r2) = std::thread::spawn(move || {
-            r1.migrate();
-            r2.migrate();
+        let mut send = r1.pre_send_disable_all([&mut r2]);
+        let (mut send, mut r1, mut r2) = std::thread::spawn(move || {
+            send.enable_many([&mut r1, &mut r2]);
+            assert!(send.all_enabled());
             *r1.borrow_mut() += 1;
             assert_eq!(*r2.borrow(), 2);
-            (r1, r2)
+            let send = r1.pre_send_disable_all([&mut r2]);
+            (send, r1, r2)
         })
         .join()
         .unwrap();
-        r1.migrate();
-        r2.migrate();
+        send.enable_many([&mut r1, &mut r2]);
+        assert!(send.all_enabled());
         assert_eq!(*r2.borrow(), 2);
     }
 
     #[test]
     #[should_panic]
-    fn missing_migrate_drop() {
+    fn missing_pre_send_drop() {
         let r = SendRc::new(RefCell::new(1));
         std::thread::spawn(move || {
             drop(r);
@@ -493,120 +571,110 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn missing_migrate_deref() {
+    fn missing_pre_send_deref() {
         let r1 = SendRc::new(RefCell::new(1));
         let r2 = SendRc::clone(&r1);
-        std::thread::spawn(move || {
-            *r1.borrow_mut() = 2;
+        let result = std::thread::spawn(move || {
+            *r1.borrow_mut() = 2; // this should panic
             assert_eq!(*r2.borrow(), 2);
         })
-        .join()
-        .unwrap();
+        .join();
+        assert!(result.is_err());
     }
 
     #[test]
     #[should_panic]
-    fn missing_second_migrate() {
+    fn incomplete_pre_send() {
+        let mut r1 = SendRc::new(RefCell::new(1));
+        let _r2 = SendRc::clone(&r1);
+        let send = r1.pre_send();
+        let _ = send.ready(); // panics because we didn't disable r1
+    }
+
+    #[test]
+    #[should_panic]
+    fn faked_pre_send_count() {
+        let mut r1 = SendRc::new(RefCell::new(1));
+        let _r2 = SendRc::clone(&r1);
+        let mut send = r1.pre_send();
+        // disabling the same SendRc twice won't fool us into thinking all instances were
+        // disabled
+        send.disable(&mut r1);
+        let _ = send.ready();
+    }
+
+    #[test]
+    fn enable_diff_threads() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
-        let (_r1, r2) = std::thread::spawn(move || {
-            r1.migrate();
-            r2.migrate();
-            *r1.borrow_mut() += 1;
-            assert_eq!(*r2.borrow(), 2);
-            (r1, r2)
+        let mut send = r1.pre_send_disable_all([&mut r2]);
+        let mut send = std::thread::spawn(move || {
+            send.enable(&mut r1);
+            send
         })
         .join()
         .unwrap();
-        // here we must call migrate() as well
-        assert_eq!(*r2.borrow(), 2);
-    }
-
-    #[test]
-    #[should_panic]
-    fn incomplete_migration() {
-        let mut r1 = SendRc::new(RefCell::new(1));
-        let r2 = SendRc::clone(&r1);
-        std::thread::spawn(move || {
-            r1.migrate();
-            let _ = &*r2;
+        let result = std::thread::spawn(move || {
+            send.enable(&mut r2);
         })
-        .join()
-        .unwrap();
+        .join();
+        assert!(result.is_err());
     }
 
     #[test]
-    #[should_panic]
-    fn faked_migrate() {
-        let mut r1 = SendRc::new(RefCell::new(1));
-        let r2 = SendRc::clone(&r1);
-        std::thread::spawn(move || {
-            // calling migrate twice on the same value won't fool us into thinking the
-            // SendRc is fully migrated
-            r1.migrate();
-            r1.migrate();
-            let _ = &*r2;
-        })
-        .join()
-        .unwrap();
-    }
-
-    #[test]
-    #[should_panic]
-    fn migrate_diff_threads() {
-        let mut r1 = SendRc::new(RefCell::new(1));
-        let mut r2 = SendRc::clone(&r1);
-        std::thread::spawn(move || {
-            r1.migrate();
-        })
-        .join()
-        .unwrap();
-        std::thread::spawn(move || {
-            r2.migrate();
-        })
-        .join()
-        .unwrap();
-    }
-
-    #[test]
-    #[should_panic]
-    fn migrate_half_way() {
-        let barrier = Arc::new(Barrier::new(2));
-        let mut r1 = SendRc::new(RefCell::new(1));
-        let r2 = SendRc::clone(&r1);
-        std::thread::spawn({
-            let barrier = barrier.clone();
-            move || {
-                r1.migrate();
-                barrier.wait();
-                std::mem::forget(r1); // avoid another panic
-            }
-        });
-        barrier.wait();
-        // not allowed to proceed
-        let _ = r2.clone();
-    }
-
-    #[test]
-    fn incomplete_migration_use_migrated_ref() {
-        let mut r1 = SendRc::new(RefCell::new(1));
-        let r2 = SendRc::clone(&r1);
+    fn enable_half_way() {
         let state = Arc::new(Mutex::new(0));
+        let mut r1 = SendRc::new(RefCell::new(1));
+        let mut r2 = SendRc::clone(&r1);
+        let mut send = r1.pre_send_disable_all([&mut r2]);
         let result = std::thread::spawn({
-            let state = Arc::clone(&state);
+            let state = state.clone();
             move || {
                 *state.lock() = 1;
-                r1.migrate();
+                send.enable(&mut r1);
                 *state.lock() = 2;
-                let _ = &*r1;
+                *r1.borrow_mut() = 2;
                 *state.lock() = 3;
-                drop(r2);
+                let _ = &*r2; // should panic
                 *state.lock() = 4;
             }
         })
         .join();
         assert!(result.is_err());
+        assert_eq!(*state.lock(), 3);
+    }
+
+    #[test]
+    fn enable_undisabled() {
+        let state = Arc::new(Mutex::new(0));
+        let mut r1 = SendRc::new(RefCell::new(1));
+        let mut send = r1.pre_send_disable_all([]);
+        let result = std::thread::spawn({
+            let state = state.clone();
+            move || {
+                *state.lock() = 1;
+                send.enable(&mut r1);
+                let mut rogue = SendRc::clone(&r1);
+                *state.lock() = 2;
+                send.enable(&mut rogue); // should panic
+                *state.lock() = 3;
+            }
+        })
+        .join();
+        assert!(result.is_err());
         assert_eq!(*state.lock(), 2);
+    }
+
+    #[test]
+    fn enable_twice() {
+        let mut r1 = SendRc::new(RefCell::new(1));
+        let mut send = r1.pre_send_disable_all([]);
+        std::thread::spawn(move || {
+            send.enable(&mut r1);
+            send.enable(&mut r1);
+            send.enable(&mut r1);
+        })
+        .join()
+        .unwrap();
     }
 }
