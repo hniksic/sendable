@@ -1,4 +1,4 @@
-//! `SendRc<T>`, a wrapper around `Rc<T>` that is `Send` if `T` is `Send`.
+//! `SendRc<T>`, a reference-counted pointer that is `Send` if `T` is `Send`.
 //!
 //! Sometimes it is useful to construct a hierarchy of objects which include `Rc`s and
 //! send it off to another thread. `Rc` prohibits that because it can't statically prove
@@ -7,19 +7,18 @@
 //! synchronization, which would lead to a data race if two `Rc` clones were to exist in
 //! different threads.
 //!
-//! Using `Arc` helps to an extent, but still requires `T` to be `Sync`, so you can't move
-//! a hierarchy with `Arc<RefCell<T>>` to a different thread. The `Sync` requirement is
-//! because `Arc` derefs to `&T`, so allowing `Arc` clones containing non-`Sync` values to
-//! exist in different threads would break the invariant of non-`Sync` values inside -
-//! e.g. it would enable an `Arc<RefCell<u32>>` to execute `borrow()` or `borrow_mut()`
-//! from two threads without synchronization.
+//! `Arc` allows moves between threads, but requires `T` to be `Sync`, which prohibits
+//! moving an `Arc<RefCell<T>>` to a different thread. `Sync` is required because `Arc`
+//! derefs to `&T`, so sending an `Arc` to a different thread automatically implies access
+//! to `&T` from different threads. Allowed that on non-`Sync` types would enable an
+//! `Arc<RefCell<u32>>` to execute `borrow()` or `borrow_mut()` from two threads without
+//! synchronization.
 //!
-//! `SendRc` resolves the above by storing the thread ID of the thread in which it was
-//! created. Each deref, clone, and drop of the `SendRc` is only allowed from that
-//! thread. After moving `SendRc` to a different thread, you must invoke `migrate()` to
-//! migrate it to the new thread. Only after all the clones of a `SendRc` have been thus
-//! marked will access to the inner value (and to `SendRc::clone()` and `SendRc::drop()`)
-//! be allowed.
+//! `SendRc` resolves by pinning the underlying allocation to a particular thread. You can
+//! move `SendRc` to a different thread, but if you try to access the allocation, or to
+//! clone or drop the `SendRc`, you get a panic. Instead, you must first _migrate_ the
+//! `SendRc`s to the new thread by invoking `migrate()` on all the values, and only after
+//! that will the values become usable.
 
 #![warn(missing_docs)]
 
@@ -41,11 +40,10 @@ struct Inner<T> {
     // id of thread from which the value can be accessed
     pinned_to: AtomicU64,
     val: T,
-    // copy of the Rc's strong count, needed for migrate() to accesss it without having to
-    // synchronize with clone/drop possibly happening in the original thread
+    // the reference count
     strong_count: AtomicUsize,
-    // ThreadSend is only needed during migration to other thread -- box it to reduce
-    // memory overhead of wrapping.
+    // Migration is only needed while moving to the other thread, which happens
+    // rarely. Boxing it reduces memory overhead of this struct compared to just `T`.
     migration: Mutex<Option<Box<Migration>>>,
 }
 
@@ -61,22 +59,44 @@ struct Migration {
 
 static ID_NEXT: AtomicUsize = AtomicUsize::new(0);
 
-/// Wrapper around `Rc<T>` that is `Send` if `T` is `Send`.
+/// Reference-counted pointer like `Rc<T>`, but which is `Send` if `T` is `Send`.
+///
+/// This is different from `Arc` because the value can still be accessed from only one
+/// thread at a time, and it is only allowed to manipulate it (by dropping or cloning)
+/// from a single thread. This property makes it safe to store non-`Sync` types like
+/// `RefCell` inside.
+///
+/// After a `SendRc` is created, it is pinned to the current thread, and usable only in
+/// that thread. When sending a `SendRc` to different thread, you must send all the
+/// `SendRc`s that point to the same allocation, and invoke `migrate()` on each. Then they
+/// become usable in the new thread, and only there. They may then be sent to a different
+/// thread using the same process.
 ///
 /// ```
 /// # use std::cell::RefCell;
 /// # use send_rc::SendRc;
 /// let mut r1 = SendRc::new(RefCell::new(1));
 /// let mut r2 = SendRc::clone(&r1);
+/// // move both pointers to a new thread
 /// std::thread::spawn(move || {
+///     // r1 and r2 are not usable before migration
 ///     r1.migrate();
 ///     r2.migrate();
+///     // now they can be used normally
 ///     *r1.borrow_mut() += 1;
 ///     assert_eq!(*r2.borrow(), 2);
 /// })
 /// .join()
 /// .unwrap();
 /// ```
+///
+/// Compared to `Rc`, tradeoffs are:
+///
+/// * `deref()` requires a relaxed atomic atomic to check that we're accessing the contents from
+///   the correct thread.
+/// * `clone()` and `drop()` require a seqcst atomic load to check that we're in the correct
+///   thread.
+/// * takes up two machine words.
 pub struct SendRc<T> {
     ptr: NonNull<Inner<T>>,
     // associate an non-changing id with each pointer so that migrate() can track how many
@@ -84,14 +104,17 @@ pub struct SendRc<T> {
     id: usize,
 }
 
-// Safety: SendRc can be sent between threads because we prohibit access to Rc::clone(),
-// Rc::drop(), and Rc::deref() except from the thread they are pinned to. After sending
-// them to another thread, you have to call SendRc::migrate() on every one of them, which
-// establishes synchronization between subsequent accesses and previous ones.
+// Safety: SendRc can be sent between threads because we prohibit access to clone, drop,
+// and deref except from the thread they are pinned to. Access is granted only after all
+// pointers to the same allocation have been migrated to the new thread, which is why we
+// can avoid requiring T: Sync.
 unsafe impl<T> Send for SendRc<T> where T: Send {}
 
 impl<T> SendRc<T> {
-    /// Constructs a new SendRc<T>
+    /// Constructs a new `SendRc<T>`.
+    ///
+    /// The newly created `SendRc` is only usable from the current thread. After sending
+    /// it to another thread, you must call `migrate()`.
     pub fn new(val: T) -> Self {
         let ptr = Box::into_raw(Box::new(Inner {
             pinned_to: AtomicU64::new(Self::current_thread()),
@@ -99,10 +122,10 @@ impl<T> SendRc<T> {
             strong_count: AtomicUsize::new(1),
             migration: Mutex::new(None),
         }));
-        SendRc::from_ptr(ptr)
+        SendRc::from_inner_ptr(ptr)
     }
 
-    fn from_ptr(ptr: *mut Inner<T>) -> Self {
+    fn from_inner_ptr(ptr: *mut Inner<T>) -> Self {
         SendRc {
             // unwrap: we have a valid box, its pointer is not null (rustc eliminates the
             // check, https://godbolt.org/z/dsYPxxMWo)
@@ -287,7 +310,7 @@ impl<T> Clone for SendRc<T> {
         // but to ensure that subsequent deref() of the clone (which fetches pinned_to
         // with Relaxed ordering) is sound.
         self.assert_pinned_to(this_thread, "clone", SeqCst);
-        SendRc::from_ptr(self.ptr.as_ptr())
+        SendRc::from_inner_ptr(self.ptr.as_ptr())
     }
 }
 
@@ -295,8 +318,8 @@ impl<T> Drop for SendRc<T> {
     fn drop(&mut self) {
         let this_thread = Some(Self::current_thread());
         // Instead of panicking immediately, check whether we're in the correct thread and
-        // leak the Rc if we're not. Then panic, but only if we're not already panicking,
-        // because panic-inside-panic aborts the program and breaks unit tests.
+        // leak the value if we're not. Then panic, but only if we're not already
+        // panicking, because panic-inside-panic aborts the program and breaks unit tests.
         if self.is_pinned_to(this_thread, SeqCst) {
             // If a migration starts just before we decrement the count, it means the
             // migration works with a strong count that is by one too high and will never
@@ -336,7 +359,6 @@ impl<T: Default> Default for SendRc<T> {
 impl<T: Eq> Eq for SendRc<T> {}
 
 impl<T: PartialEq> PartialEq for SendRc<T> {
-    #[inline]
     fn eq(&self, other: &SendRc<T>) -> bool {
         SendRc::ptr_eq(self, other) || **self == **other
     }
