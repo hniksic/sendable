@@ -145,12 +145,16 @@ impl<T> SendRc<T> {
         }
     }
 
-    /// Prepare to send this `SendRc` to the current thread.
+    /// Prepare to send this `SendRc` and other `SendRc`s belonging to the same allocation
+    /// to the current thread.
     ///
-    /// Before moving a `SendRc` to a different thread, you must disable all pointers to this
-    /// allocation by calling `pre_send()` and invoking `disable()` on all of them. After
-    /// sending the `SendRc`s and the `PreSend` to a different thread, you can enable the
-    /// pointers by calling `PostSend::enable()`.
+    /// Before moving a `SendRc` to a different thread, you must disable all pointers to
+    /// this allocation by calling `pre_send()` once to get a send handle, and invoking
+    /// `send.disable(send_rc)` on every `SendRc` that belongs to the same
+    /// allocation. Then you can call `read()` to obtain the `PostSend` token which serves
+    /// as proof that all `SendRc`s of the allocation have been disabled. You can send the
+    /// `SendRc`s and the token to the new thread, and re-enable the pointers by calling
+    /// `enable()` on the token.
     pub fn pre_send(&mut self) -> PreSend<T> {
         self.assert_pinned("pre_send");
         let mut pre_send = PreSend {
@@ -233,7 +237,8 @@ fn current_thread() -> u64 {
     unsafe { std::mem::transmute(std::thread::current().id()) }
 }
 
-/// Handle for disabling the `SendRc`s before they are sent to another thread.
+/// Handle for disabling the `SendRc`s of a particular allocation before they are sent to
+/// another thread.
 pub struct PreSend<T> {
     ptr: NonNull<Inner<T>>,
     disabled: HashSet<usize>,
@@ -247,6 +252,9 @@ impl<T> PreSend<T> {
     /// You must call `disable()` on all `SendRc`s pointing to an allocation before moving
     /// them to another thread.
     pub fn disable(&mut self, send_rc: &mut SendRc<T>) {
+        if send_rc.ptr != NonNull::dangling() && send_rc.ptr != self.ptr {
+            panic!("disable() must be called with the same allocation as use for pre_send()");
+        }
         self.disabled.insert(send_rc.id);
         send_rc.ptr = NonNull::dangling();
     }
@@ -267,10 +275,13 @@ impl<T> PreSend<T> {
         self.disabled.len() == inner.strong_count.get()
     }
 
-    /// Returns a handle that can be sent to another thread to re-enable the `SendRc`s
+    /// Returns a token that can proves all `SendRc`s have been disabled.
+    ///
+    /// This token can be sent to another thread and used to re-enable the `SendRc`s
     /// there.
     ///
-    /// Panics if `all_disabled()` would return false.
+    /// Panics if not all `SendRc`s have been disabled, i.e. if `all_disabled()` would
+    /// return false.
     pub fn ready(self) -> PostSend<T> {
         if !self.all_disabled() {
             panic!("ready() called before all SendRcs have been disabled");
@@ -593,7 +604,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn faked_pre_send_count() {
+    fn faked_pre_send_count_reusing_same_ptr() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let _r2 = SendRc::clone(&r1);
         let mut send = r1.pre_send();
@@ -601,6 +612,22 @@ mod tests {
         // disabled
         send.disable(&mut r1);
         let _ = send.ready();
+    }
+
+    #[test]
+    #[should_panic = "must be called with the same allocation"]
+    fn faked_pre_send_count_using_other_allocation() {
+        let mut r1 = SendRc::new(RefCell::new(1));
+        let _r2 = SendRc::clone(&r1);
+        let mut rogue = SendRc::new(RefCell::new(1));
+        let mut send = r1.pre_send();
+        // using SendRc from a different allocation won't fool us into thinking all
+        // instances were disabled
+        send.disable(&mut rogue);
+        let _ = send.ready(); // this should panic
+        // avoid panic in drops in case the above didn't panic
+        std::mem::forget(r1);
+        std::mem::forget(rogue);
     }
 
     #[test]
