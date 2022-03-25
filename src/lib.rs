@@ -155,6 +155,12 @@ impl<T> SendRc<T> {
     /// as proof that all `SendRc`s of the allocation have been disabled. You can send the
     /// `SendRc`s and the token to the new thread, and re-enable the pointers by calling
     /// `enable()` on the token.
+    ///
+    /// Calling `x.pre_send()` automatically disables `x`, so you don't have to do it
+    /// explicitly (but there is no harm if you do).
+    ///
+    /// Panics when invoked from a different thread than the one the `SendRc` was created
+    /// in or last migrated to.
     pub fn pre_send(&mut self) -> PreSend<T> {
         self.assert_pinned("pre_send");
         let mut pre_send = PreSend {
@@ -169,6 +175,10 @@ impl<T> SendRc<T> {
     ///
     /// Equivalent to calling `pre_send()`, disabling the provided `SendRc`s, and invoking
     /// `PreSend::ready()`.
+    ///
+    /// Returns the `PostSend` token which you can send to a different thread along with
+    /// the `SendRc`s, or panics if not all `SendRc`s of this allocation have been
+    /// provided.
     pub fn pre_send_disable_all<'a>(
         &mut self,
         everyone: impl IntoIterator<Item = &'a mut Self>,
