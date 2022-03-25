@@ -14,7 +14,7 @@
 //! `Arc<RefCell<u32>>` to execute `borrow()` or `borrow_mut()` from two threads without
 //! synchronization.
 //!
-//! `SendRc` resolves by pinning the underlying allocation to a particular thread. You can
+//! `SendRc` resolves the issue by pinning the underlying allocation to a thread. You can
 //! move `SendRc` to a different thread, but if you try to deref, clone, or drop it, you
 //! get a panic. Instead, you must first disable hte `SendRc`s in the original thread, and
 //! then reenable them in the new thread, after which they become usable again.
@@ -23,7 +23,7 @@
 
 use std::borrow::Borrow;
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
@@ -59,18 +59,17 @@ static ID_NEXT: AtomicUsize = AtomicUsize::new(0);
 /// # use send_rc::SendRc;
 /// let mut r1 = SendRc::new(RefCell::new(1));
 /// let mut r2 = SendRc::clone(&r1);
-/// let mut r3 = SendRc::clone(&r1);
-/// let mut send = r1.pre_send_disable_all([&mut r2, &mut r3]);
-/// // move the pointers to a new thread
+/// let mut send = SendRc::pre_send();
+/// send.disable(&mut r1); // r1 is unusable from this point
+/// send.disable(&mut r2); // r2 is unusable from this point
+/// let mut send = send.ready(); // panics if there are un-disabled SendRcs to the allocation of r1/r2
+/// // move everything to a different thread
 /// std::thread::spawn(move || {
 ///     // pointers are unusable here
-///     send.enable(&mut r1);
-///     // r1 is usable here
-///     send.enable_many([&mut r2, &mut r3]);
-///     // all three can now be used normally
+///     send.enable(&mut r1); // r1 is usable from this point
+///     send.enable(&mut r2); // r2 is usable from this point
 ///     *r1.borrow_mut() += 1;
 ///     assert_eq!(*r2.borrow(), 2);
-///     assert_eq!(*r3.borrow(), 2);
 /// })
 /// .join()
 /// .unwrap();
@@ -81,6 +80,7 @@ static ID_NEXT: AtomicUsize = AtomicUsize::new(0);
 /// * `deref()`, `clone()`, and `drop()` requires a check that the pointer is not disabled,
 ///    and a relaxed atomic load to check that we're accessing it from the correct thread.
 /// * takes up two machine words.
+/// * doesn't support weak pointers (though such support could be added).
 pub struct SendRc<T> {
     ptr: NonNull<Inner<T>>,
     // associate an non-changing id with each pointer so that we can track how many
@@ -141,53 +141,50 @@ impl<T> SendRc<T> {
 
     fn assert_pinned(&self, op: &str) {
         if let Err(msg) = self.check_pinned() {
-            panic!("SendRc::{op}: {msg}");
+            panic!("{op}: {msg}");
         }
     }
 
-    /// Prepare to send this `SendRc` and other `SendRc`s belonging to the same allocation
-    /// to the current thread.
+    /// Prepare to send `SendRc`s of this type to a different thread.
     ///
-    /// Before moving a `SendRc` to a different thread, you must disable all pointers to
-    /// this allocation by calling `pre_send()` once to get a send handle, and invoking
-    /// `send.disable(send_rc)` on every `SendRc` that belongs to the same
-    /// allocation. Then you can call `read()` to obtain the `PostSend` token which serves
-    /// as proof that all `SendRc`s of the allocation have been disabled. You can send the
-    /// `SendRc`s and the token to the new thread, and re-enable the pointers by calling
-    /// `enable()` on the token.
+    /// Before moving a `SendRc` to a different thread, you must disable it and all other
+    /// `SendRc`s pointing to the same its allocation:
     ///
-    /// Calling `x.pre_send()` automatically disables `x`, so you don't have to do it
-    /// explicitly (but there is no harm if you do).
-    ///
-    /// Panics when invoked from a different thread than the one the `SendRc` was created
-    /// in or last migrated to.
-    pub fn pre_send(&mut self) -> PreSend<T> {
-        self.assert_pinned("pre_send");
-        let mut pre_send = PreSend {
-            ptr: self.ptr,
-            disabled: HashSet::new(),
-        };
-        pre_send.disable(self);
-        pre_send
+    /// ```
+    /// # use std::cell::RefCell;
+    /// # use send_rc::SendRc;
+    /// let mut r1 = SendRc::new(RefCell::new(1));
+    /// let mut r2 = SendRc::clone(&r1);
+    /// let mut send = SendRc::pre_send();
+    /// send.disable(&mut r1);
+    /// send.disable(&mut r2);
+    /// let mut send = send.ready();
+    /// // send, r1, and r2 can now be send to a different thread, and re-enabled
+    /// // by calling send.enable(&mut r1) and send.enable(&mut r2)
+    /// # send.enable(&mut r1); send.enable(&mut r2); // avoid panic in doctest
+    /// ```
+    pub fn pre_send() -> PreSend<T> {
+        PreSend {
+            disabled: HashMap::new(),
+        }
     }
 
     /// Prepare to send this and other `SendRc`s to a different thread.
     ///
-    /// Equivalent to calling `pre_send()`, disabling the provided `SendRc`s, and invoking
-    /// `PreSend::ready()`.
+    /// Equivalent to calling `pre_send()`, calling `disable()` on the provided `SendRc`s,
+    /// and invoking `ready()`.
     ///
     /// Returns the `PostSend` token which you can send to a different thread along with
-    /// the `SendRc`s, or panics if not all `SendRc`s of this allocation have been
-    /// provided.
-    pub fn pre_send_disable_all<'a>(
-        &mut self,
-        everyone: impl IntoIterator<Item = &'a mut Self>,
-    ) -> PostSend<T>
+    /// the `SendRc`s.
+    ///
+    /// Panics if there are allocations pointed to by `SendRc`s in `all` which have extra
+    /// `SendRc`s not included in `all`.
+    pub fn pre_send_disable_all<'a>(all: impl IntoIterator<Item = &'a mut Self>) -> PostSend<T>
     where
         T: 'a,
     {
-        let mut send = self.pre_send();
-        send.disable_many(everyone);
+        let mut send = Self::pre_send();
+        send.disable_many(all);
         send.ready()
     }
 
@@ -196,7 +193,7 @@ impl<T> SendRc<T> {
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last migrated to.
     pub fn strong_count(this: &Self) -> usize {
-        this.assert_pinned("strong_count");
+        this.assert_pinned("SendRc::strong_count()");
         this.inner().strong_count.get()
     }
 
@@ -205,7 +202,7 @@ impl<T> SendRc<T> {
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last migrated to.
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
-        this.assert_pinned("try_unwrap");
+        this.assert_pinned("SendRc::try_unwrap()");
         if this.inner().strong_count.get() == 1 {
             // Safety: refcount is 1, so it's just us, and the pointer was obtained using
             // Box::into_raw().
@@ -222,7 +219,7 @@ impl<T> SendRc<T> {
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last migrated to.
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
-        this.assert_pinned("get_mut");
+        this.assert_pinned("SendRc::get_mut()");
         if this.inner().strong_count.get() == 1 {
             Some(&mut this.inner_mut().val)
         } else {
@@ -247,11 +244,9 @@ fn current_thread() -> u64 {
     unsafe { std::mem::transmute(std::thread::current().id()) }
 }
 
-/// Handle for disabling the `SendRc`s of a particular allocation before they are sent to
-/// another thread.
+/// Handle for disabling the `SendRc`s before they are sent to another thread.
 pub struct PreSend<T> {
-    ptr: NonNull<Inner<T>>,
-    disabled: HashSet<usize>,
+    disabled: HashMap<usize, NonNull<Inner<T>>>,
 }
 
 impl<T> PreSend<T> {
@@ -259,13 +254,18 @@ impl<T> PreSend<T> {
     ///
     /// After this call it is no longer possible to deref, clone, or drop this `SendRc`.
     ///
-    /// You must call `disable()` on all `SendRc`s pointing to an allocation before moving
-    /// them to another thread.
+    /// After disabling a `SendRc`, you must disable other `SendRc`s pointing to the same
+    /// allocation. This needs to be done before the call to `ready()`.
+    ///
+    /// Panics when invoked from a different thread than the one the `SendRc` was created
+    /// in or last migrated to.
     pub fn disable(&mut self, send_rc: &mut SendRc<T>) {
-        if send_rc.ptr != NonNull::dangling() && send_rc.ptr != self.ptr {
-            panic!("disable() must be called with the same allocation as use for pre_send()");
+        if self.disabled.contains_key(&send_rc.id) {
+            // make calling disabled() twice a no-op
+            return;
         }
-        self.disabled.insert(send_rc.id);
+        send_rc.assert_pinned("PreSend::disable()");
+        self.disabled.insert(send_rc.id, send_rc.ptr);
         send_rc.ptr = NonNull::dangling();
     }
 
@@ -279,10 +279,40 @@ impl<T> PreSend<T> {
         }
     }
 
-    /// Returns true if all the `SendRc`s have been disabled and `ready()` can be called.
+    /// Returns true if there are no allocations whose `SendRc`s we've disabled, but which
+    /// have outstanding `SendRc`s we haven't yet disabled.
+    ///
+    /// For example:
+    /// ```
+    /// # use std::cell::RefCell;
+    /// # use send_rc::SendRc;
+    /// let mut r1 = SendRc::new(RefCell::new(1));
+    /// let mut r2 = SendRc::clone(&r1);
+    /// let mut q1 = SendRc::new(RefCell::new(1));
+    /// let mut q2 = SendRc::clone(&q1);
+    /// let mut send = SendRc::pre_send();
+    /// send.disable(&mut r1);
+    /// assert!(send.all_disabled() == false); // r2 not disabled
+    /// send.disable(&mut r2);
+    /// assert!(send.all_disabled() == true); // r1/r2 allocation fully disabled, q1/q2 doesn't participate
+    /// send.disable(&mut q1);
+    /// assert!(send.all_disabled() == false); // r1/r2 ok, but q2 not disabled
+    /// send.disable(&mut q2);
+    /// assert!(send.all_disabled() == true); // both r1/r2 allocations and q1/q2 allocations fully disabled
+    /// # std::mem::forget([r1, r2, q1, q2]);
+    /// ```
     pub fn all_disabled(&self) -> bool {
-        let inner = unsafe { &*self.ptr.as_ptr() };
-        self.disabled.len() == inner.strong_count.get()
+        let ptr_sendref_cnt: HashMap<_, usize> =
+            self.disabled
+                .values()
+                .fold(HashMap::new(), |mut map, &ptr| {
+                    *map.entry(ptr).or_default() += 1;
+                    map
+                });
+        ptr_sendref_cnt.into_iter().all(|(ptr, cnt)| {
+            let inner = unsafe { &*ptr.as_ptr() };
+            cnt == inner.strong_count.get()
+        })
     }
 
     /// Returns a token that can proves all `SendRc`s have been disabled.
@@ -290,27 +320,29 @@ impl<T> PreSend<T> {
     /// This token can be sent to another thread and used to re-enable the `SendRc`s
     /// there.
     ///
-    /// Panics if not all `SendRc`s have been disabled, i.e. if `all_disabled()` would
-    /// return false.
+    /// Panics if there are outstanding `SendRc`s we haven't yet disabled, i.e. if
+    /// `all_disabled()` would return false.
     pub fn ready(self) -> PostSend<T> {
         if !self.all_disabled() {
-            panic!("ready() called before all SendRcs have been disabled");
+            panic!("PreSend::ready() called before all SendRcs have been disabled");
         }
         PostSend {
-            ptr: self.ptr,
+            disabled: self.disabled,
             enabled: HashSet::new(),
-            expected: self.disabled.len(),
             prev_thread: current_thread(),
         }
     }
 }
 
 /// Handle for enabling the `SendRc`s after they are sent to another thread.
+///
+/// Since `PostSend` can only be obtained via `PreSend::read()`, possessing a `PostSend`
+/// serves as proof that all `SendRc`s belonging to the allocations involved in the move
+/// have been disabled.
 #[must_use]
 pub struct PostSend<T> {
-    ptr: NonNull<Inner<T>>,
+    disabled: HashMap<usize, NonNull<Inner<T>>>,
     enabled: HashSet<usize>,
-    expected: usize,
     prev_thread: u64,
 }
 
@@ -319,21 +351,32 @@ unsafe impl<T> Send for PostSend<T> where T: Send {}
 impl<T> PostSend<T> {
     /// Make `send_rc` usable again after having moved it to a new thread.
     pub fn enable(&mut self, send_rc: &mut SendRc<T>) {
-        let inner = unsafe { &*self.ptr.as_ptr() };
-        let old_pinned_to = inner.pinned_to.swap(current_thread(), Ordering::SeqCst);
-        if old_pinned_to != self.prev_thread && old_pinned_to != current_thread() {
-            panic!("PostSend::enable() called from multiple threads");
+        if self.enabled.contains(&send_rc.id) {
+            // make calling enable() twice a no-op
+            return;
         }
         if send_rc.ptr != NonNull::dangling() {
-            if self.enabled.contains(&send_rc.id) {
-                // make calling enable() twice a no-op
-                return;
-            }
-            // attempted "enable" of a new SendRc, possibly obtained by cloning an already
-            // enabled one
             panic!("PostSend::enable() called on a non-disabled SendRc");
         }
-        send_rc.ptr = self.ptr;
+        // This can happen with two PostSends which encompass different allocations, and
+        // enable() is called with a SendRc that belongs to the wrong one.
+        let ptr = self
+            .disabled
+            .get(&send_rc.id)
+            .copied()
+            .expect("PostSend::enable() called on a SendRc disabled separately");
+        let inner = unsafe { &*ptr.as_ptr() };
+        // Check previously pinned thread in case someone sends PostSend to another
+        // thread, enables a pointer, and then sends it to a third thread and enables
+        // another one.
+        let old_pinned_to = inner.pinned_to.load(Ordering::Relaxed);
+        if old_pinned_to != self.prev_thread && old_pinned_to != current_thread() {
+            panic!("PostSend::enable() called from different threads");
+        }
+        // We can get away with load+store without CAS because this can't happen in
+        // parallel, since we take &mut self.
+        inner.pinned_to.store(current_thread(), Ordering::Relaxed);
+        send_rc.ptr = ptr;
         self.enabled.insert(send_rc.id);
     }
 
@@ -352,7 +395,7 @@ impl<T> PostSend<T> {
     /// Useful for asserting that the post-send traversal hasn't missed a `SendRc`
     /// somewhere.
     pub fn all_enabled(&self) -> bool {
-        self.enabled.len() == self.expected
+        self.enabled.len() == self.disabled.len()
     }
 }
 
@@ -394,14 +437,14 @@ impl<T> Deref for SendRc<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.assert_pinned("deref");
+        self.assert_pinned("SendRc::deref()");
         &self.inner().val
     }
 }
 
 impl<T> Clone for SendRc<T> {
     fn clone(&self) -> Self {
-        self.assert_pinned("clone");
+        self.assert_pinned("SendRc::clone()");
         self.inner()
             .strong_count
             .set(self.inner().strong_count.get() + 1);
@@ -492,9 +535,7 @@ where
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::Arc;
-
-    use parking_lot::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::SendRc;
 
@@ -549,7 +590,7 @@ mod tests {
     fn ok_send() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
-        let mut send = r1.pre_send_disable_all([&mut r2]);
+        let mut send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
 
         std::thread::spawn(move || {
             send.enable_many([&mut r1, &mut r2]);
@@ -564,13 +605,13 @@ mod tests {
     fn send_and_return() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
-        let mut send = r1.pre_send_disable_all([&mut r2]);
+        let mut send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
         let (mut send, mut r1, mut r2) = std::thread::spawn(move || {
             send.enable_many([&mut r1, &mut r2]);
             assert!(send.all_enabled());
             *r1.borrow_mut() += 1;
             assert_eq!(*r2.borrow(), 2);
-            let send = r1.pre_send_disable_all([&mut r2]);
+            let send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
             (send, r1, r2)
         })
         .join()
@@ -608,8 +649,23 @@ mod tests {
     fn incomplete_pre_send() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let _r2 = SendRc::clone(&r1);
-        let send = r1.pre_send();
-        let _ = send.ready(); // panics because we didn't disable r1
+        let mut send = SendRc::pre_send();
+        send.disable(&mut r1);
+        let _ = send.ready(); // panics because we didn't disable _r2
+    }
+
+    #[test]
+    #[should_panic = "before all SendRcs have been disabled"]
+    fn incomplete_pre_send_other_allocation() {
+        let mut r1 = SendRc::new(RefCell::new(1));
+        let mut r2 = SendRc::clone(&r1);
+        let mut q1 = SendRc::new(RefCell::new(1));
+        let _q2 = SendRc::clone(&q1);
+        let mut send = SendRc::pre_send();
+        send.disable(&mut r1);
+        send.disable(&mut r2);
+        send.disable(&mut q1);
+        let _ = send.ready(); // _q2 is missing
     }
 
     #[test]
@@ -617,34 +673,19 @@ mod tests {
     fn faked_pre_send_count_reusing_same_ptr() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let _r2 = SendRc::clone(&r1);
-        let mut send = r1.pre_send();
+        let mut send = SendRc::pre_send();
         // disabling the same SendRc twice won't fool us into thinking all instances were
         // disabled
+        send.disable(&mut r1);
         send.disable(&mut r1);
         let _ = send.ready();
     }
 
     #[test]
-    #[should_panic = "must be called with the same allocation"]
-    fn faked_pre_send_count_using_other_allocation() {
-        let mut r1 = SendRc::new(RefCell::new(1));
-        let _r2 = SendRc::clone(&r1);
-        let mut rogue = SendRc::new(RefCell::new(1));
-        let mut send = r1.pre_send();
-        // using SendRc from a different allocation won't fool us into thinking all
-        // instances were disabled
-        send.disable(&mut rogue);
-        let _ = send.ready(); // this should panic
-        // avoid panic in drops in case the above didn't panic
-        std::mem::forget(r1);
-        std::mem::forget(rogue);
-    }
-
-    #[test]
-    fn enable_diff_threads() {
+    fn enable_same_send_diff_threads() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
-        let mut send = r1.pre_send_disable_all([&mut r2]);
+        let mut send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
         let mut send = std::thread::spawn(move || {
             send.enable(&mut r1);
             send
@@ -663,49 +704,49 @@ mod tests {
         let state = Arc::new(Mutex::new(0));
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
-        let mut send = r1.pre_send_disable_all([&mut r2]);
+        let mut send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
         let result = std::thread::spawn({
             let state = state.clone();
             move || {
-                *state.lock() = 1;
+                *state.lock().unwrap() = 1;
                 send.enable(&mut r1);
-                *state.lock() = 2;
+                *state.lock().unwrap() = 2;
                 *r1.borrow_mut() = 2;
-                *state.lock() = 3;
+                *state.lock().unwrap() = 3;
                 let _ = &*r2; // should panic
-                *state.lock() = 4;
+                *state.lock().unwrap() = 4;
             }
         })
         .join();
         assert!(result.is_err());
-        assert_eq!(*state.lock(), 3);
+        assert_eq!(*state.lock().unwrap(), 3);
     }
 
     #[test]
     fn enable_undisabled() {
         let state = Arc::new(Mutex::new(0));
         let mut r1 = SendRc::new(RefCell::new(1));
-        let mut send = r1.pre_send_disable_all([]);
+        let mut send = SendRc::pre_send_disable_all([&mut r1]);
         let result = std::thread::spawn({
             let state = state.clone();
             move || {
-                *state.lock() = 1;
+                *state.lock().unwrap() = 1;
                 send.enable(&mut r1);
                 let mut rogue = SendRc::clone(&r1);
-                *state.lock() = 2;
+                *state.lock().unwrap() = 2;
                 send.enable(&mut rogue); // should panic
-                *state.lock() = 3;
+                *state.lock().unwrap() = 3;
             }
         })
         .join();
         assert!(result.is_err());
-        assert_eq!(*state.lock(), 2);
+        assert_eq!(*state.lock().unwrap(), 2);
     }
 
     #[test]
     fn enable_twice() {
         let mut r1 = SendRc::new(RefCell::new(1));
-        let mut send = r1.pre_send_disable_all([]);
+        let mut send = SendRc::pre_send_disable_all([&mut r1]);
         std::thread::spawn(move || {
             send.enable(&mut r1);
             send.enable(&mut r1);
@@ -713,5 +754,42 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn disable_twice_good() {
+        let mut r1 = SendRc::new(RefCell::new(1));
+        let mut r2 = SendRc::new(RefCell::new(1));
+        let mut send = SendRc::pre_send();
+        send.disable(&mut r1);
+        send.disable(&mut r1);
+        send.disable(&mut r2);
+        let _ = send.ready();
+        // avoid panic on drop
+        std::mem::forget([r1, r2]);
+    }
+
+    #[test]
+    fn disable_twice_bad() {
+        let state = Arc::new(Mutex::new(0));
+        let result = std::thread::spawn({
+            let state = state.clone();
+            move || {
+                let mut r1 = SendRc::new(RefCell::new(1));
+                let mut r2 = SendRc::new(RefCell::new(1));
+                let mut send1 = SendRc::pre_send();
+                let mut send2 = SendRc::pre_send();
+                *state.lock().unwrap() = 1;
+                send1.disable(&mut r1);
+                *state.lock().unwrap() = 2;
+                send1.disable(&mut r2);
+                *state.lock().unwrap() = 3;
+                send2.disable(&mut r2); // panic
+                *state.lock().unwrap() = 4;
+            }
+        })
+        .join();
+        assert!(result.is_err());
+        assert_eq!(*state.lock().unwrap(), 3);
     }
 }
