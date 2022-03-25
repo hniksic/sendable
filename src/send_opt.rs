@@ -1,0 +1,216 @@
+use std::mem::ManuallyDrop;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use super::send_rc::current_thread;
+
+/// Like `Option<T>`, but `Send`, even if `T` is not `Send`.
+///
+/// This is safe because values of type `T` are never actually sent, as we require
+/// `SendOption` to be `None` to be transferred to another thread. If access to a
+/// non-`None` option is detected in another thread, access to its contents (including
+/// through drop) will be forbidden with panic.
+///
+/// To migrate `SendOption` to another thread, set it to `None`, send it to the new
+/// thread, and call `post_send()`.
+pub struct SendOption<T> {
+    pinned_to: AtomicU64,
+    inner: ManuallyDrop<Option<T>>,
+}
+
+unsafe impl<T> Send for SendOption<T> {}
+
+impl<T> SendOption<T> {
+    /// Create new `SendOption<T>`, pinned to the current thread.
+    pub fn new(val: Option<T>) -> Self {
+        SendOption {
+            pinned_to: AtomicU64::new(current_thread()),
+            inner: ManuallyDrop::new(val),
+        }
+    }
+
+    #[inline]
+    fn check_pinned(&self) -> bool {
+        self.pinned_to.load(Ordering::Relaxed) == current_thread()
+    }
+
+    fn assert_pinned(&self) {
+        if !self.check_pinned() {
+            panic!("attempt to use non-None SendOption from different thread");
+        }
+    }
+
+    /// Called after the option has been sent to another thread.
+    ///
+    /// This will panic if the option is not `None`.
+    pub fn post_send(&mut self) {
+        if self.inner.is_some() {
+            panic!("attempt to send non-None SendOption to a different thread");
+        }
+        self.pinned_to.store(current_thread(), Ordering::Relaxed);
+    }
+}
+
+impl<T> Deref for SendOption<T> {
+    type Target = Option<T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.assert_pinned();
+        &self.inner
+    }
+}
+
+impl<T> DerefMut for SendOption<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.assert_pinned();
+        &mut self.inner
+    }
+}
+
+impl<T> Drop for SendOption<T> {
+    fn drop(&mut self) {
+        if self.check_pinned() {
+            unsafe {
+                ManuallyDrop::drop(&mut self.inner);
+            }
+        } else if !std::thread::panicking() {
+            panic!("attempt to drop non-None SendOption from different thread");
+        }
+    }
+}
+
+impl<T: Clone> Clone for SendOption<T> {
+    fn clone(&self) -> Self {
+        SendOption::new((&**self).clone())
+    }
+}
+
+impl<T> Default for SendOption<T> {
+    fn default() -> Self {
+        SendOption::new(None)
+    }
+}
+
+#[cfg(feature = "deepsize")]
+impl<T> deepsize::DeepSizeOf for SendOption<T>
+where
+    T: deepsize::DeepSizeOf,
+{
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.inner.deep_size_of_children(context)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use super::SendOption;
+
+    #[test]
+    fn trivial() {
+        let mut o = SendOption::new(Some(Rc::new(0)));
+        assert_eq!(o.as_deref(), Some(&0));
+        *o = None;
+        assert_eq!(o.as_ref(), None);
+        *o = Some(Rc::new(0));
+    }
+
+    #[test]
+    #[should_panic]
+    fn bad_deref_some() {
+        let o = SendOption::new(Some(Rc::new(0)));
+        std::thread::spawn(move || {
+            let _ = &*o;
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn bad_deref_none() {
+        let o: SendOption<Rc<u32>> = SendOption::new(None);
+        std::thread::spawn(move || {
+            let _ = &*o;
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn bad_deref_mut() {
+        let mut o = SendOption::new(Some(Rc::new(0)));
+        std::thread::spawn(move || {
+            let _ = &mut *o;
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn bad_drop() {
+        let o = SendOption::new(Some(Rc::new(0)));
+        std::thread::spawn(move || {
+            drop(o);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn good_send() {
+        let mut o: SendOption<Rc<u32>> = SendOption::default();
+        std::thread::spawn(move || {
+            o.post_send();
+            *o = Some(Rc::new(1));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn send_and_return_bad1() {
+        let mut o: SendOption<Rc<u32>> = SendOption::default();
+        let o = std::thread::spawn(move || {
+            o.post_send();
+            *o = Some(Rc::new(1));
+            o
+        })
+        .join()
+        .unwrap();
+        let _ = &*o; // must panic because we haven't called post_send()
+    }
+
+    #[test]
+    #[should_panic]
+    fn send_and_return_bad2() {
+        let mut o: SendOption<Rc<u32>> = SendOption::default();
+        let mut o = std::thread::spawn(move || {
+            o.post_send();
+            *o = Some(Rc::new(1));
+            o
+        })
+        .join()
+        .unwrap();
+        o.post_send(); // must panic because it's not None
+    }
+
+    #[test]
+    fn send_and_return_good() {
+        let mut o: SendOption<Rc<u32>> = SendOption::default();
+        let mut o = std::thread::spawn(move || {
+            o.post_send();
+            *o = Some(Rc::new(1));
+            *o = None;
+            o
+        })
+        .join()
+        .unwrap();
+        o.post_send();
+        let _ = &*o;
+    }
+}

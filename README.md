@@ -1,14 +1,17 @@
-# send-rc
+# sendable
 
-The `send-rc` crate defines a single-threaded reference-counted pointer that can be sent
-between threads. You can think of it as a variant of `Rc<T>` that is `Send` if `T` is
-`Send`. This is unlike `Rc<T>` which is never `Send`, and also unlike `Arc<T>`, which
-requires `T: Send + Sync` to be `Send`.
+The `sendable` crate defines two types that facilitate sending data between threads:
 
-## How does it work?
+* `SendRc`, a single-threaded reference-counted pointer that can be sent between
+  threads. You can think of it as a variant of `Rc<T>` that is `Send` if `T` is
+  `Send`. This is unlike `Rc<T>` which is never `Send`, and also unlike `Arc<T>`, which
+  requires `T: Send + Sync` to be `Send`.
+* `SendOption`, a container like `Option<T>` that is `Send` even if `T` is not `Send`.
 
-When `SendRc` is first created, it stores the id of the current thread on the heap, next
-to the value and the reference count. Before granting access to the value, and before
+## How does SendRc work?
+
+When `SendRc` is constructed, it stores the id of the current thread on the heap, next to
+the value and the reference count. Before granting access to the value, and before
 modifying the reference count through `clone()` and `drop()` it checks that the `SendRc`
 is still in the thread it was created in.
 
@@ -38,7 +41,7 @@ std::thread::spawn(move || {
 .unwrap();
 ```
 
-## When is this needed?
+## When is SendRc needed?
 
 When working inside a single thread, it is allowed and perfectly safe to create a
 hierarchy that shares data using `Rc` and involves optional mutation using `Cell` and
@@ -102,29 +105,51 @@ hacky and gives up the guarantees afforded by Rust. If you make a mistake, say b
 an `Rc` clone in the original thread, you're back to core dumps like in C++. In Rust we
 hope to do better, and `SendRc` is my attempt to make such an operation safe.
 
+## What about SendOption?
+
+`SendOption` is an even stranger proposition: a type that holds `T` that is _always_
+`Send`, regardless of whether `T` is `Send`. Surely that can't be safe?
+
+The thing is that `SendOption` forces you to set it to `None` before sending off the value
+to another thread. If the option is `None`, it doesn't matter if `T` is `!Send` because no
+`T` is actually getting sent anywhere. If you smuggle a non-`None` `SendOption<T>` into
+another thread, `SendOption` will just panic on access (and access includes drop).
+
+`SendOption` is designed for types which are composed of `Send` data, except for an
+optional field that is not `Send`. The field is set and used only inside a particular
+thread, and will be `None` while sent across threads, but since Rust can't prove that, a
+field of `Option<NonSend>` makes the entire type not `Send`. For example, a field with a
+`SendOption<Rc<Arena>>` could be used to create a `Send` type that refers to a
+single-threaded arena.
+
 ## Is this really safe?
 
-As with any crate that uses unsafe code, one can never be 100% positive that there is no
+As with any crate that involves unsafe, one can never be 100% certain that there is no
 soundness bug. I spent some time going through the design and reviewing the implementation
-before I settled on the current approach. While I did find the occasional issue, the
-design held.
+before settling on the current approach. While I did find the occasional issue, the design
+held.
 
-You are invited to look at the code - it is not large - and report any issues you
+You are invited to review at the code - it is not large - and report any issues you
 encounter.
 
 ## Are the run-time checks expensive?
 
-While they are certainly more expensive than the `Rc` which doesn't need them, they are
-still quite cheap. `deref()` just checks that the pointer is not dangling (which means
-that that `SendRc` was disabled) and fetches the id of the pinned-to thread using a
-relaxed atomic load, which compiles into an ordinary load on Intel. It's hard to be
-cheaper than that, and if you're worried, you can hold on to the reference to avoid
-repeating the checks. (The borrow checker will prevent you from sending the `SendRc` to
-another thread while there is an outstanding reference.) `clone()` and `drop()` do the
-same kind of check.
+While run-time checks are certainly more expensive than in case of `Rc` and `Option` which
+don't need any, they are still quite cheap.
+
+`SendRc::deref()` just checks that the `SendRc` was not disabled (by comparing to a
+constant) and compares the id of the pinned-to thread fetched with a relaxed atomic load
+with the current thread. The relaxed atomic load compiles to an ordinary load on Intel,
+which is as cheap as it gets, and if you're worried, you can hold on to the reference to
+avoid repeating the checks. (The borrow checker will prevent you from sending the `SendRc`
+to another thread while there is an outstanding reference.) `SendRc::clone()` and
+`SendRc::drop()` do the same kind of check.
+
+`Option::deref()` and `Option::deref_mut()` only check that the current thread is the
+pinned-to thread, the same as `SendRc`.
 
 ## License
 
-`send-rc` is distributed under the terms of both the MIT license and the Apache License
+`sendable` is distributed under the terms of both the MIT license and the Apache License
 (Version 2.0).  See [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT) for
 details.  Contributing changes is assumed to signal agreement with these licensing terms.
