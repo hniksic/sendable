@@ -6,8 +6,8 @@ authors = ["Hrvoje Nikšić <hniksic@gmail.com>"]
 license = "Apache-2.0/MIT"
 repository = "https://github.com/hniksic/send-rc"
 #documentation = "https://docs.rs/send-rc/"
-#keywords = [...]
-#description = "..."
+keywords = ["threads", "rc", "send"]
+description = "A single-threaded reference-counted pointer that can be sent between threads."
 
 [dependencies]
 deepsize = { version = "0.2.0", optional = true }

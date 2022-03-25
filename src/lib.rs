@@ -62,7 +62,8 @@ static ID_NEXT: AtomicUsize = AtomicUsize::new(0);
 /// let mut send = SendRc::pre_send();
 /// send.disable(&mut r1); // r1 is unusable from this point
 /// send.disable(&mut r2); // r2 is unusable from this point
-/// let mut send = send.ready(); // panics if there are un-disabled SendRcs to the allocation of r1/r2
+/// let mut send = send.ready(); // would panic if there were un-disabled SendRcs pointing to
+///                              // the allocation of r1/r2
 /// // move everything to a different thread
 /// std::thread::spawn(move || {
 ///     // pointers are unusable here
