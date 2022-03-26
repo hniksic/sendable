@@ -385,28 +385,6 @@ impl<T> PostSend<T> {
     }
 }
 
-/// Common trait for PreSend::disable() and AfterSend::enable(), allowing a common
-/// implementation of visiting the `SendRc`s.
-pub trait SendVisit<T> {
-    /// Visit the `SendRc`.
-    ///
-    /// When invoked on `PreSend`, this calls `disable()`.
-    /// When invoked on `PostSend`, this calls `enable()`.
-    fn visit(&mut self, send_rc: &mut SendRc<T>);
-}
-
-impl<T> SendVisit<T> for PreSend<T> {
-    fn visit(&mut self, send_rc: &mut SendRc<T>) {
-        self.disable(send_rc);
-    }
-}
-
-impl<T> SendVisit<T> for PostSend<T> {
-    fn visit(&mut self, send_rc: &mut SendRc<T>) {
-        self.enable(send_rc);
-    }
-}
-
 impl<T: Display> Display for SendRc<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&**self, f)

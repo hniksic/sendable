@@ -27,4 +27,4 @@ mod thread_id;
 mod deepsize;
 
 pub use send_opt::SendOption;
-pub use self::send_rc::{SendRc, SendVisit};
+pub use send_rc::SendRc;
