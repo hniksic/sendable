@@ -13,7 +13,7 @@ use crate::thread_id::current_thread;
 /// contents (including through drop) will be detected and prevented with panic.
 ///
 /// To migrate `SendOption` to another thread, set it to `None`, send it across, and call
-/// `post_send()` to use it normally.
+/// [`post_send()`](SendOption::post_send) to use it normally.
 pub struct SendOption<T> {
     pinned_to: AtomicU64,
     inner: ManuallyDrop<Option<T>>,

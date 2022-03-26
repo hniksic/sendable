@@ -263,6 +263,9 @@ impl<T> PreSendRc<T> {
     /// Returns true if there are no allocations whose `SendRc`s we've disabled, but which
     /// have outstanding `SendRc`s we haven't yet disabled.
     ///
+    /// If this returns true, it means [`ready()`](PreSendRc::ready) will succeed without
+    /// panic.
+    ///
     /// For example:
     /// ```
     /// # use std::cell::RefCell;
@@ -299,7 +302,7 @@ impl<T> PreSendRc<T> {
         })
     }
 
-    /// Returns a token that can proves all `SendRc`s have been disabled.
+    /// Returns a [`PostSendRc`] token that can proves all `SendRc`s have been disabled.
     ///
     /// This token can be sent to another thread and used to re-enable the `SendRc`s
     /// there.
@@ -320,9 +323,9 @@ impl<T> PreSendRc<T> {
 
 /// Handle for enabling the `SendRc`s after they are sent to another thread.
 ///
-/// Since `PostSendRc` can only be obtained via `PreSendRc::ready()`, possessing a `PostSendRc`
-/// serves as proof that all `SendRc`s belonging to the allocations involved in the move
-/// have been disabled.
+/// Since `PostSendRc` can only be obtained via [`PreSendRc::ready()`], possessing a
+/// `PostSendRc` serves as proof that all `SendRc`s belonging to the allocations involved
+/// in the move have been disabled.
 #[must_use]
 pub struct PostSendRc<T> {
     disabled: HashMap<usize, NonNull<Inner<T>>>,
