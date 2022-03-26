@@ -321,7 +321,7 @@ impl<T> PreSend<T> {
 
 /// Handle for enabling the `SendRc`s after they are sent to another thread.
 ///
-/// Since `PostSend` can only be obtained via `PreSend::read()`, possessing a `PostSend`
+/// Since `PostSend` can only be obtained via `PreSend::ready()`, possessing a `PostSend`
 /// serves as proof that all `SendRc`s belonging to the allocations involved in the move
 /// have been disabled.
 #[must_use]
