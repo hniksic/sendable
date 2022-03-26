@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -93,13 +94,20 @@ impl<T> Default for SendOption<T> {
     }
 }
 
+impl<T: Debug> Debug for SendOption<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let opt: &Option<T> = &**self;
+        f.debug_tuple("SendOption").field(opt).finish()
+    }
+}
+
 #[cfg(feature = "deepsize")]
 impl<T> deepsize::DeepSizeOf for SendOption<T>
 where
     T: deepsize::DeepSizeOf,
 {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.inner.deep_size_of_children(context)
+        (&**self).deep_size_of_children(context)
     }
 }
 
@@ -116,6 +124,12 @@ mod tests {
         *o = None;
         assert_eq!(o.as_ref(), None);
         *o = Some(Rc::new(0));
+    }
+
+    #[test]
+    fn debug_impl() {
+        assert_eq!(format!("{:?}", SendOption::new(Some(0))), "SendOption(Some(0))");
+        assert_eq!(format!("{:?}", SendOption::new(None::<u32>)), "SendOption(None)");
     }
 
     #[test]
