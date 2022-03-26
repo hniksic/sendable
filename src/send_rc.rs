@@ -587,8 +587,8 @@ mod tests {
             assert!(post_send.all_enabled());
             *r1.borrow_mut() += 1;
             assert_eq!(*r2.borrow(), 2);
-            let send = SendRc::pre_send_ready([&mut r1, &mut r2]);
-            (send, r1, r2)
+            let post_send = SendRc::pre_send_ready([&mut r1, &mut r2]);
+            (post_send, r1, r2)
         })
         .join()
         .unwrap();
