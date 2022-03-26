@@ -1,25 +1,26 @@
 # sendable
 
-The `sendable` crate defines two types that facilitate sending data between threads:
+The `sendable` crate defines types to facilitate sending data between threads:
 
 * `SendRc`, a single-threaded reference-counting pointer that can be sent between
   threads. You can think of it as a variant of `Rc<T>` that is `Send` if `T` is
   `Send`. This is unlike `Rc<T>` which is never `Send`, and also unlike `Arc<T>`, which
   requires `T: Send + Sync` to be `Send`.
-* `SendOption`, a container like `Option<T>` that is `Send` even if `T` is not `Send`.
+* `SendOption`, which holds an `Option<T>` and is `Send` even if `T` is not `Send`.
 
 ## How does SendRc work?
 
-When `SendRc` is constructed, it stores the id of the current thread next to the value and
-the reference count. Before granting access to the value, and before modifying the
-reference count through `clone()` and `drop()`, it checks that the `SendRc` is still in
-the thread it was created in.
+When a `SendRc` is constructed, it stores the current thread id next to the value and the
+reference count. On access to the value, and before manipulating the reference count
+through `clone()` and `drop()`, it checks that the `SendRc` is still in the thread it was
+created in.
 
 When a hierarchy containing `SendRc`s needs to be moved to a different thread, each
-pointer is marked for sending using the API provided for that purpose. Once thus marked,
-access to underlying data is disabled from that pointer, even in the original thread. When
-all pointers are disabled, they can be sent across the thread boundary, and re-enabled.
-In a simple case of two pointers, the process looks like this:
+pointer is explicitly marked for sending using the API provided for that purpose. Once
+thus marked, access to underlying data from that pointer is prohibited, even in the
+original thread. When all pointers to an allocation disabled, they can be sent across the
+thread boundary, and explicitly re-enabled in the new thread.  In a simple case of two
+`SendRc`s, the process looks like this:
 
 ```rust
 // create two SendRcs pointing to the same allocation
@@ -47,19 +48,19 @@ std::thread::spawn(move || {
 
 ## When is SendRc needed?
 
-When working inside a single thread, data sharing with `Rc` and optional mutation with
-`Cell` and `RefCell` are both safe and convenient. They are also efficient because they
-are implemented without atomics and mutexes, allowing the compiler to inline and optimize
-away calls to `borrow()` and `borrow_mut()` where they are not globally observable.
+Within the confines of a single thread, data sharing via `Rc` and optional mutation with
+`Cell` and `RefCell` are both convenient and safe. They are also efficient because they
+don't require atomics or locks, allowing the compiler to inline and optimize away calls to
+`borrow()` and `borrow_mut()` where they are not globally observable.
 
-If you decouple creation of such hierarchy from its use, it is useful to be able to create
-it in one thread and use it in another. After all, `RefCell` and `Cell` are `Send` - they
-involve interior mutability, but no sharing. The trouble is with `Rc`, which is neither
-`Send` nor `Sync`, and for good reason. Even though it would be perfectly fine to move an
-entire hierarchy of `Rc<RefCell>`s from one thread to another, the borrow checker doesn't
-allow it because it cannot statically prove that you have moved _all_ of them. If some
-remain in the original thread, they'll wreak havoc with unsychronized manipulation of the
-reference count.
+In real-world programs it comes very useful to decouple creation from the use of such
+data, and in particular to create it in one thread and use it in another. After all, both
+`RefCell` and `Cell` are `Send` - they provide interior mutability, but no sharing. The
+trouble is with `Rc`, which is neither `Send` nor `Sync`, and for good reason. Even though
+it would be perfectly fine to move an entire hierarchy of `Rc<RefCell>`s from one thread
+to another, the borrow checker doesn't allow it because it cannot statically prove that
+you have moved _all_ of them. If some remain in the original thread, the unsynchronized
+manipulation of the reference count will constitute undefined behavior and wreak havoc.
 
 If there were a way to demonstrate to Rust that you've sent all pointers to a particular
 allocation to a different thread, there would be no problem in moving `Rc<T>` instances to
@@ -89,9 +90,9 @@ disregarding the cost, the issue is also conceptual: it is simply wrong to use
 `Arc<Mutex<T>>` if neither `Arc` nor `Mutex` is actually needed because the code *doesn't*
 access the value of `T` from multiple threads in parallel.
 
-In summary, `SendRc<T>` is `Send`, with some guarantees enforced at run time, the same way
-an `Arc<Mutex<T>>` is `Send + Sync`, with some guarantees enforced at run time. They just
-serve different purposes.
+In summary, `SendRc<T>` is `Send`, with certains guarantees enforced at run time, the same
+way an `Arc<Mutex<T>>` is `Send + Sync`, with certain guarantees enforced at run
+time. They just serve different purposes.
 
 ## Why not use an arena? Or unsafe?
 
@@ -117,22 +118,23 @@ addresses this scenario.
 
 ## What about SendOption?
 
-`SendOption` is an even stranger proposition: a type that holds `Option<T>` and is
-_always_ `Send`, regardless of whether `T` is `Send`. Surely that can't be safe?
+`SendOption` is a related proposition: a type that holds `Option<T>` and is _always_
+`Send`, regardless of whether `T` is `Send`. Surely that can't be safe?
 
-The idea is that `SendOption` requires you to set it to `None` before sending off the
-value to another thread. If the option is `None`, it doesn't matter if `T` is `!Send`
-because no `T` is actually getting sent anywhere. If you do send a non-`None`
-`SendOption<T>` into another thread, `SendOption` will prevent you from accessing it in
-any way (including by dropping it). That way if you cheat, the `T` will still effectively
-never have been "sent" to another thread, only memcopied and forgotten, and that's safe.
+What makes it work is that `SendOption` requires you to set the value to `None` before
+sending it to another thread. If the inner `Option<T>` is `None`, it doesn't matter if `T`
+is `!Send` because no `T` is actually getting sent anywhere. If you do send a non-`None`
+`SendOption<T>` into another thread, `SendOption` will use panic to prevent you from
+accessing it in any way (including by dropping it). Failure to abide by the rules results
+in a `T` that was effectively never "sent" to another thread, only its bits were
+shallow-copied and forgotten, and that's safe.
 
 `SendOption` is designed for types which are composed of `Send` data, except for an
-optional field that is not `Send`. The field is set and used only inside a particular
+optional field of a non-send type. The field is set and used only inside a particular
 thread, and will be `None` while sent across threads, but since Rust can't prove that, a
-field of `Option<NonSend>` makes the entire type not `Send`. For example, a field with a
-`SendOption<Rc<Arena>>` could be used to create a `Send` type that refers to a
-single-threaded arena.
+field of `Option<NonSendType>` makes the entire outer type not `Send`. For example, a
+field with a `SendOption<Rc<Arena>>` could be used to create a `Send` type that refers to
+a single-threaded arena.
 
 ## Is this really safe?
 
