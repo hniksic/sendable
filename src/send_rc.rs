@@ -508,16 +508,6 @@ impl<T: Hash> Hash for SendRc<T> {
     }
 }
 
-#[cfg(feature = "deepsize")]
-impl<T> deepsize::DeepSizeOf for SendRc<T>
-where
-    T: deepsize::DeepSizeOf,
-{
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.inner().val.deep_size_of_children(context)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;

@@ -23,5 +23,8 @@ mod send_opt;
 mod send_rc;
 mod thread_id;
 
+#[cfg(feature = "deepsize")]
+mod deepsize;
+
 pub use send_opt::SendOption;
 pub use self::send_rc::{SendRc, SendVisit};

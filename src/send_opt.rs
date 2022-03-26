@@ -101,16 +101,6 @@ impl<T: Debug> Debug for SendOption<T> {
     }
 }
 
-#[cfg(feature = "deepsize")]
-impl<T> deepsize::DeepSizeOf for SendOption<T>
-where
-    T: deepsize::DeepSizeOf,
-{
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        (&**self).deep_size_of_children(context)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
