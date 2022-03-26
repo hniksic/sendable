@@ -5,7 +5,8 @@ edition = "2021"
 authors = ["Hrvoje Nikšić <hniksic@gmail.com>"]
 license = "Apache-2.0/MIT"
 repository = "https://github.com/hniksic/send-rc"
-#documentation = "https://docs.rs/sendable/"
+homepage = "https://github.com/hniksic/send-rc"
+documentation = "https://docs.rs/sendable/"
 keywords = ["thread", "rc", "send", "option"]
 description = "Rc and Option equivalents that facilitate sending data between threads."
 
