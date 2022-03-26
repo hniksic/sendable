@@ -112,8 +112,8 @@ Finally, one can avoid the arena by just using `unsafe impl Send` on a root type
 used to send the whole world to the new thread, and borrow checker be damned. That
 solution is hacky and gives up the guarantees afforded by Rust. If you make a mistake, say
 by leaving an `Rc` clone in the original thread, you're back to core dumps like in C++. In
-Rust we hope to do better, and `SendRc` is an attempt to make such a wrapper actually
-sound.
+Rust we hope to do better, and `SendRc` is an attempt to make such a sound solution that
+addresses this scenario.
 
 ## What about SendOption?
 
@@ -161,6 +161,11 @@ to another thread while there is an outstanding reference.) `SendRc::clone()` an
 
 `SendOption::deref()` and `SendOption::deref_mut()` only check that the current thread is
 the pinned-to thread, the same as in `SendRc`.
+
+Regarding memory, `SendRc`'s heap overhead is the same as that of an `Rc` (because
+`SendRc` doesn't support weak references) - two machine words. Each `SendRc` is itself two
+words wide because it has to track the identity of each pointer. `SendOption` stores a
+`u64` alongside the underlying option.
 
 ## License
 
