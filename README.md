@@ -77,8 +77,8 @@ forbidden, and is why `Arc<RefCell<T>>` is not a thing in Rust.
 `SendRc` can get away with allowing this because it requires proof that all access to the
 allocated value in the previous thread was relinquished before allowing the value to be
 pinned to a new thread. `SendRc<RefCell<u32>>` is sound because if you clone it and send
-the clone to a different thread, you won't be able to access the data, nor or clone or
-even drop it - any of these would result in a panic.
+the clone to a different thread, you won't be able to access the data, nor clone or even
+drop it - any of these would result in a panic.
 
 One could fix the issue by using the full-blown `Arc<Mutex<T>>` or `Arc<RwLock<T>>`.
 However, that slows down access to data because it requires atomics, poison checks, and
@@ -89,9 +89,9 @@ disregarding the cost, the issue is also conceptual: it is simply wrong to use
 `Arc<Mutex<T>>` if neither `Arc` nor `Mutex` is actually needed because the code *doesn't*
 access the value of `T` from multiple threads in parallel.
 
-In summary, `SendRc<T>` really _is_ `Send`, with some guarantees enforced at run time,
-just like an `Arc<Mutex<T>>` really _is_ `Send + Sync`, with some guarantees enforced at
-run time. They serve different purposes.
+In summary, `SendRc<T>` is `Send`, with some guarantees enforced at run time, the same way
+an `Arc<Mutex<T>>` is `Send + Sync`, with some guarantees enforced at run time. They just
+serve different purposes.
 
 ## Why not use an arena? Or unsafe?
 
@@ -162,10 +162,10 @@ to another thread while there is an outstanding reference.) `SendRc::clone()` an
 `SendOption::deref()` and `SendOption::deref_mut()` only check that the current thread is
 the pinned-to thread, the same as in `SendRc`.
 
-Regarding memory, `SendRc`'s heap overhead is the same as that of an `Rc` (because
-`SendRc` doesn't support weak references) - two machine words. Each `SendRc` is itself two
-words wide because it has to track the identity of each pointer. `SendOption` stores a
-`u64` alongside the underlying option.
+Regarding memory usage, `SendRc`'s heap overhead is two machine words, the same as that of
+an `Rc` (but `SendRc` doesn't support weak references). Additoinally, each individual
+`SendRc` is two machine words wide because it has to carry an identity of the pointer.
+`SendOption` stores a `u64` alongside the underlying option.
 
 ## License
 
