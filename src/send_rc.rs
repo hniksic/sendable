@@ -19,12 +19,12 @@ struct Inner<T> {
 
 static ID_NEXT: AtomicUsize = AtomicUsize::new(0);
 
-/// Reference-counted pointer like `Rc<T>`, but which is `Send` if `T` is `Send`.
+/// Reference-counting pointer like `Rc<T>`, but which is `Send` if `T` is `Send`.
 ///
 /// This is different from `Arc` because the value can still be accessed from only one
 /// thread at a time, and it is only allowed to manipulate it (by dropping or cloning)
-/// from a single thread. This property makes it safe to store non-`Sync` types like
-/// `RefCell` inside.
+/// from a single thread. This property makes it `Send` even when holding non-`Sync` types
+/// like `RefCell`.
 ///
 /// After a `SendRc` is created, it is pinned to the current thread, and usable only in
 /// that thread. When sending a `SendRc` to different thread, you must first disable all
@@ -35,16 +35,20 @@ static ID_NEXT: AtomicUsize = AtomicUsize::new(0);
 /// ```
 /// # use std::cell::RefCell;
 /// # use sendable::SendRc;
+/// // create two SendRcs pointing to the same allocation
 /// let mut r1 = SendRc::new(RefCell::new(1));
 /// let mut r2 = SendRc::clone(&r1);
+///
+/// // prepare to ship them off to a different thread
 /// let mut send = SendRc::pre_send();
 /// send.disable(&mut r1); // r1 is unusable from this point
 /// send.disable(&mut r2); // r2 is unusable from this point
 /// let mut send = send.ready(); // would panic if there were un-disabled SendRcs pointing to
 ///                              // the allocation of r1/r2
+///
 /// // move everything to a different thread
 /// std::thread::spawn(move || {
-///     // pointers are unusable here
+///     // both pointers are unusable here
 ///     send.enable(&mut r1); // r1 is usable from this point
 ///     send.enable(&mut r2); // r2 is usable from this point
 ///     *r1.borrow_mut() += 1;
