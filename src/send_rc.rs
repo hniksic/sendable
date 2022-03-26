@@ -132,8 +132,8 @@ impl<T> SendRc<T> {
 
     /// Prepare to send `SendRc`s of this type to a different thread.
     ///
-    /// Before moving a `SendRc` to a different thread, you must disable it and all other
-    /// `SendRc`s pointing to the same its allocation:
+    /// Before moving a `SendRc` to a different thread, you must disable it as well as all
+    /// other `SendRc`s pointing to the same allocation:
     ///
     /// ```
     /// # use std::cell::RefCell;
@@ -154,17 +154,16 @@ impl<T> SendRc<T> {
         }
     }
 
-    /// Prepare to send this and other `SendRc`s to a different thread.
+    /// Prepare to send a fixed collection of `SendRc`s to a different thread.
     ///
-    /// Equivalent to calling `pre_send()`, calling `disable()` on the provided `SendRc`s,
-    /// and invoking `ready()`.
-    ///
-    /// Returns the `PostSend` token which you can send to a different thread along with
-    /// the `SendRc`s.
+    /// Calls `SendRc::pre_send()`, then `disable()` on the provided `SendRc`s, then
+    /// finishes the pre-send phase with a call to `ready()`. Returns the `PostSend` token
+    /// which to send to the new thread along with the `SendRc`s and use to re-enable the
+    /// `SendRc`s.
     ///
     /// Panics if there are allocations pointed to by `SendRc`s in `all` which have extra
     /// `SendRc`s not included in `all`.
-    pub fn pre_send_disable_all<'a>(all: impl IntoIterator<Item = &'a mut Self>) -> PostSend<T>
+    pub fn pre_send_ready<'a>(all: impl IntoIterator<Item = &'a mut Self>) -> PostSend<T>
     where
         T: 'a,
     {
@@ -567,7 +566,7 @@ mod tests {
     fn ok_send() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
-        let mut post_send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
+        let mut post_send = SendRc::pre_send_ready([&mut r1, &mut r2]);
 
         std::thread::spawn(move || {
             post_send.enable_many([&mut r1, &mut r2]);
@@ -582,13 +581,13 @@ mod tests {
     fn send_and_return() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
-        let mut post_send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
+        let mut post_send = SendRc::pre_send_ready([&mut r1, &mut r2]);
         let (mut post_send, mut r1, mut r2) = std::thread::spawn(move || {
             post_send.enable_many([&mut r1, &mut r2]);
             assert!(post_send.all_enabled());
             *r1.borrow_mut() += 1;
             assert_eq!(*r2.borrow(), 2);
-            let send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
+            let send = SendRc::pre_send_ready([&mut r1, &mut r2]);
             (send, r1, r2)
         })
         .join()
@@ -673,7 +672,7 @@ mod tests {
     fn enable_same_send_diff_threads() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
-        let mut post_send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
+        let mut post_send = SendRc::pre_send_ready([&mut r1, &mut r2]);
         let mut post_send = std::thread::spawn(move || {
             post_send.enable(&mut r1);
             post_send
@@ -692,7 +691,7 @@ mod tests {
         let state = Arc::new(Mutex::new(0));
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
-        let mut post_send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
+        let mut post_send = SendRc::pre_send_ready([&mut r1, &mut r2]);
         let result = std::thread::spawn({
             let state = state.clone();
             move || {
@@ -714,7 +713,7 @@ mod tests {
     fn enable_undisabled() {
         let state = Arc::new(Mutex::new(0));
         let mut r1 = SendRc::new(RefCell::new(1));
-        let mut post_send = SendRc::pre_send_disable_all([&mut r1]);
+        let mut post_send = SendRc::pre_send_ready([&mut r1]);
         let result = std::thread::spawn({
             let state = state.clone();
             move || {
@@ -734,7 +733,7 @@ mod tests {
     #[test]
     fn enable_twice() {
         let mut r1 = SendRc::new(RefCell::new(1));
-        let mut post_send = SendRc::pre_send_disable_all([&mut r1]);
+        let mut post_send = SendRc::pre_send_ready([&mut r1]);
         std::thread::spawn(move || {
             post_send.enable(&mut r1);
             post_send.enable(&mut r1);
