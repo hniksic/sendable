@@ -98,17 +98,17 @@ impl<T> SendRc<T> {
     }
 
     fn inner(&self) -> &Inner<T> {
-        // Safety: Inner is valid for as long as self
+        // Safety: Allocation is valid at least as long as self
         unsafe { self.ptr.as_ref() }
     }
 
-    fn inner_mut(&mut self) -> &mut Inner<T> {
-        // Safety: Inner is valid for as long as self
-        unsafe { self.ptr.as_mut() }
+    // Safety: requires reference count of 1
+    unsafe fn inner_mut(&mut self) -> &mut Inner<T> {
+        self.ptr.as_mut()
     }
 
     #[inline]
-    fn check_pinned(&self) -> Result<(), &'static str> {
+    fn check_pinned_and_valid(&self) -> Result<(), &'static str> {
         if self.ptr == NonNull::dangling() {
             return Err("attempt to use disabled SendRc");
         }
@@ -118,8 +118,8 @@ impl<T> SendRc<T> {
         Ok(())
     }
 
-    fn assert_pinned(&self, op: &str) {
-        if let Err(msg) = self.check_pinned() {
+    fn assert_pinned_and_valid(&self, op: &str) {
+        if let Err(msg) = self.check_pinned_and_valid() {
             panic!("{op}: {msg}");
         }
     }
@@ -172,7 +172,7 @@ impl<T> SendRc<T> {
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last migrated to.
     pub fn strong_count(this: &Self) -> usize {
-        this.assert_pinned("SendRc::strong_count()");
+        this.assert_pinned_and_valid("SendRc::strong_count()");
         this.inner().strong_count.get()
     }
 
@@ -181,7 +181,7 @@ impl<T> SendRc<T> {
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last migrated to.
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
-        this.assert_pinned("SendRc::try_unwrap()");
+        this.assert_pinned_and_valid("SendRc::try_unwrap()");
         if this.inner().strong_count.get() == 1 {
             // Safety: refcount is 1, so it's just us, and the pointer was obtained using
             // Box::into_raw().
@@ -198,9 +198,10 @@ impl<T> SendRc<T> {
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last migrated to.
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
-        this.assert_pinned("SendRc::get_mut()");
+        this.assert_pinned_and_valid("SendRc::get_mut()");
         if this.inner().strong_count.get() == 1 {
-            Some(&mut this.inner_mut().val)
+            // Safety: we've checked that refcount is 1
+            unsafe { Some(&mut this.inner_mut().val) }
         } else {
             None
         }
@@ -213,6 +214,10 @@ impl<T> SendRc<T> {
 }
 
 /// Handle for disabling the `SendRc`s before they are sent to another thread.
+///
+/// This handle cannot be sent to a different thread; when done with calls to `disable()`,
+/// invoke `ready()` to obtain a token that can be moved to the other thread to re-enable
+/// the `SendRc`s.
 pub struct PreSend<T> {
     disabled: HashMap<usize, NonNull<Inner<T>>>,
 }
@@ -229,10 +234,13 @@ impl<T> PreSend<T> {
     /// in or last migrated to.
     pub fn disable(&mut self, send_rc: &mut SendRc<T>) {
         if self.disabled.contains_key(&send_rc.id) {
-            // make calling disabled() twice a no-op
+            // make calling disable() twice a no-op
             return;
         }
-        send_rc.assert_pinned("PreSend::disable()");
+        // If send_rc.ptr is dangling, it means the send_rc was already disabled in
+        // another SendRc.  This is a programming error, and will be caught by
+        // assert_pinned_and_valid().
+        send_rc.assert_pinned_and_valid("PreSend::disable()");
         self.disabled.insert(send_rc.id, send_rc.ptr);
         send_rc.ptr = NonNull::dangling();
     }
@@ -270,14 +278,17 @@ impl<T> PreSend<T> {
     /// # std::mem::forget([r1, r2, q1, q2]);
     /// ```
     pub fn all_disabled(&self) -> bool {
-        let ptr_sendref_cnt: HashMap<_, usize> =
+        // Count how many `SendRc`s point to each allocation.
+        let ptr_sendrc_cnt: HashMap<_, usize> =
             self.disabled
                 .values()
                 .fold(HashMap::new(), |mut map, &ptr| {
                     *map.entry(ptr).or_default() += 1;
                     map
                 });
-        ptr_sendref_cnt.into_iter().all(|(ptr, cnt)| {
+        ptr_sendrc_cnt.into_iter().all(|(ptr, cnt)| {
+            // Safety: allocation is valid because there is at least 1 SendRc pointing to
+            // it. We may access it from this thread because PreSend isn't Send.
             let inner = unsafe { &*ptr.as_ptr() };
             cnt == inner.strong_count.get()
         })
@@ -314,6 +325,8 @@ pub struct PostSend<T> {
     prev_thread: u64,
 }
 
+// Safety: pointers to allocations can be sent to a new thread because PreSend::ready()
+// checked that all their SendRcs have been disabled.
 unsafe impl<T> Send for PostSend<T> where T: Send {}
 
 impl<T> PostSend<T> {
@@ -326,13 +339,13 @@ impl<T> PostSend<T> {
         if send_rc.ptr != NonNull::dangling() {
             panic!("PostSend::enable() called on a non-disabled SendRc");
         }
-        // This can happen with two PostSends which encompass different allocations, and
-        // enable() is called with a SendRc that belongs to the wrong one.
+        // This will panic if the SendRc was disabled by another PreSend.
         let ptr = self
             .disabled
             .get(&send_rc.id)
             .copied()
-            .expect("PostSend::enable() called on a SendRc disabled separately");
+            .expect("PostSend::enable() called on a SendRc disabled elsewhere");
+        // Safety: SendRc guarantees that the pointer points to valid allocation.
         let inner = unsafe { &*ptr.as_ptr() };
         // Check previously pinned thread in case someone sends PostSend to another
         // thread, enables a pointer, and then sends it to a third thread and enables
@@ -405,14 +418,14 @@ impl<T> Deref for SendRc<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.assert_pinned("SendRc::deref()");
+        self.assert_pinned_and_valid("SendRc::deref()");
         &self.inner().val
     }
 }
 
 impl<T> Clone for SendRc<T> {
     fn clone(&self) -> Self {
-        self.assert_pinned("SendRc::clone()");
+        self.assert_pinned_and_valid("SendRc::clone()");
         self.inner()
             .strong_count
             .set(self.inner().strong_count.get() + 1);
@@ -425,7 +438,7 @@ impl<T> Drop for SendRc<T> {
         // Instead of panicking immediately, check whether we're in the correct thread and
         // leak the value if we're not. Then panic, but only if we're not already
         // panicking, because panic-inside-panic aborts the program and breaks unit tests.
-        match self.check_pinned() {
+        match self.check_pinned_and_valid() {
             Ok(()) => {
                 let refcnt = self.inner().strong_count.get();
                 if refcnt == 1 {
@@ -438,7 +451,7 @@ impl<T> Drop for SendRc<T> {
             }
             Err(msg) => {
                 if !std::thread::panicking() {
-                    panic!("drop: {msg}");
+                    panic!("SendRc::drop(): {msg}");
                 }
             }
         }
@@ -647,6 +660,17 @@ mod tests {
         send.disable(&mut r1);
         send.disable(&mut r1);
         let _ = send.ready();
+    }
+
+    #[test]
+    #[should_panic = "attempt to use disabled"]
+    fn disable_same_sendrc_in_different_presend() {
+        let mut r = SendRc::new(RefCell::new(1));
+        let mut send1 = SendRc::pre_send();
+        send1.disable(&mut r);
+        let mut send2 = SendRc::pre_send();
+        send2.disable(&mut r);
+        std::mem::forget(r); // prevent panic on drop
     }
 
     #[test]

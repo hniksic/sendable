@@ -110,10 +110,12 @@ hope to do better, and `SendRc` is my attempt to make such an operation safe.
 `SendOption` is an even stranger proposition: a type that holds `T` that is _always_
 `Send`, regardless of whether `T` is `Send`. Surely that can't be safe?
 
-The thing is that `SendOption` forces you to set it to `None` before sending off the value
-to another thread. If the option is `None`, it doesn't matter if `T` is `!Send` because no
-`T` is actually getting sent anywhere. If you smuggle a non-`None` `SendOption<T>` into
-another thread, `SendOption` will just panic on access (and access includes drop).
+The idea is that `SendOption` requires you to set it to `None` before sending off the
+value to another thread. If the option is `None`, it doesn't matter if `T` is `!Send`
+because no `T` is actually getting sent anywhere. If you do send a non-`None`
+`SendOption<T>` into another thread, `SendOption` will prevent you from accessing it in
+any way (including by dropping it). That way if you cheat, the `T` will still effectively
+never have been "sent" to another thread, only memcopied and forgotten, and that's safe.
 
 `SendOption` is designed for types which are composed of `Send` data, except for an
 optional field that is not `Send`. The field is set and used only inside a particular
@@ -125,9 +127,11 @@ single-threaded arena.
 ## Is this really safe?
 
 As with any crate that involves unsafe, one can never be 100% certain that there is no
-soundness bug. I spent some time going through the design and reviewing the implementation
-before settling on the current approach. While I did find the occasional issue, the design
-held.
+soundness bug. The code is fairly straightforward in implementing the design outlined
+above. I went through several iterations of the design and the implementation before
+settling on the current approach and, while I did find the occasional issue, the
+underlying idea held up under scrutiny. MIRI finds no undefined behavior while running the
+tests.
 
 You are invited to review at the code - it is not large - and report any issues you
 encounter.

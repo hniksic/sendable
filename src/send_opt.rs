@@ -4,20 +4,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::thread_id::current_thread;
 
-/// Like `Option<T>`, but `Send`, even if `T` is not `Send`.
+/// Like `Option<T>`, but `Send` even if `T` is not `Send`.
 ///
-/// This is safe because values of type `T` are never actually sent, as we require
-/// `SendOption` to be `None` to be transferred to another thread. If access to a
-/// non-`None` option is detected in another thread, access to its contents (including
-/// through drop) will be forbidden with panic.
+/// This is sound because we require `SendOption` to be `None` when transferred across
+/// thread boundary, so `T` values are never actually moved across threads.  If this is
+/// violated by sending a non-`None` `SendOption` to another thread, access to its
+/// contents (including through drop) will be detected and prevented with panic.
 ///
-/// To migrate `SendOption` to another thread, set it to `None`, send it to the new
-/// thread, and call `post_send()`.
+/// To migrate `SendOption` to another thread, set it to `None`, send it across, and call
+/// `post_send()` to use it normally.
 pub struct SendOption<T> {
     pinned_to: AtomicU64,
     inner: ManuallyDrop<Option<T>>,
 }
 
+// Safety: we don't allow a T to be sent to another thread and accessed there in any way.
 unsafe impl<T> Send for SendOption<T> {}
 
 impl<T> SendOption<T> {
@@ -34,9 +35,9 @@ impl<T> SendOption<T> {
         self.pinned_to.load(Ordering::Relaxed) == current_thread()
     }
 
-    fn assert_pinned(&self) {
+    fn assert_pinned(&self, op: &str) {
         if !self.check_pinned() {
-            panic!("attempt to use non-None SendOption from different thread");
+            panic!("{op}: attempt to use non-None SendOption from different thread");
         }
     }
 
@@ -55,14 +56,14 @@ impl<T> Deref for SendOption<T> {
     type Target = Option<T>;
 
     fn deref(&self) -> &Self::Target {
-        self.assert_pinned();
+        self.assert_pinned("SendOption::deref()");
         &self.inner
     }
 }
 
 impl<T> DerefMut for SendOption<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.assert_pinned();
+        self.assert_pinned("SendOption::deref_mut()");
         &mut self.inner
     }
 }
@@ -70,11 +71,12 @@ impl<T> DerefMut for SendOption<T> {
 impl<T> Drop for SendOption<T> {
     fn drop(&mut self) {
         if self.check_pinned() {
+            // Safety: we call drop() only once, and we don't access self.inner after it.
             unsafe {
                 ManuallyDrop::drop(&mut self.inner);
             }
         } else if !std::thread::panicking() {
-            panic!("attempt to drop non-None SendOption from different thread");
+            panic!("SendOption::drop(): attempt to use non-None SendOption from different thread");
         }
     }
 }
