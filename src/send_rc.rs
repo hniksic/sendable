@@ -66,8 +66,10 @@ static ID_NEXT: AtomicUsize = AtomicUsize::new(0);
 /// * doesn't support weak pointers (though such support could be added).
 pub struct SendRc<T> {
     ptr: NonNull<Inner<T>>,
-    // associate an non-changing id with each pointer so that we can track how many
-    // have participated in migration
+    // Associate an non-changing id with each pointer so that we can track how many have
+    // participated in migration. If malicious code forces wrap-around of the id, we're
+    // still sound because passing two SendRcs with the same id to `PreSend::disable()`
+    // will just cause `PreSend::ready()` to always fail and prevent migration.
     id: usize,
 }
 
