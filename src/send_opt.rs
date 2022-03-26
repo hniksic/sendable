@@ -2,7 +2,7 @@ use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::send_rc::current_thread;
+use crate::thread_id::current_thread;
 
 /// Like `Option<T>`, but `Send`, even if `T` is not `Send`.
 ///

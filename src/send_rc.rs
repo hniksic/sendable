@@ -6,7 +6,8 @@ use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::thread::ThreadId;
+
+use crate::thread_id::current_thread;
 
 struct Inner<T> {
     // id of thread from which the value can be accessed
@@ -209,17 +210,6 @@ impl<T> SendRc<T> {
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
         this.ptr == other.ptr
     }
-}
-
-// Temporary workaround until ThreadId::as_u64() is stabilized.
-pub(crate) fn current_thread() -> u64 {
-    // This is not a guarantee that ThreadId is safe to transmute to u64, but it's
-    // better than nothing.
-    const _: () = assert!(std::mem::size_of::<ThreadId>() == 8);
-
-    // Safety: ThreadId must have layout compatible with that of a u64, which is the
-    // case in the stdlib where it's NonZeroU64.
-    unsafe { std::mem::transmute(std::thread::current().id()) }
 }
 
 /// Handle for disabling the `SendRc`s before they are sent to another thread.
