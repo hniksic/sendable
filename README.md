@@ -27,17 +27,17 @@ let mut r1 = SendRc::new(RefCell::new(1));
 let mut r2 = SendRc::clone(&r1);
 
 // prepare to ship them off to a different thread
-let mut send = SendRc::pre_send();
-send.disable(&mut r1); // r1 is unusable from this point
-send.disable(&mut r2); // r2 is unusable from this point
-let mut send = send.ready(); // would panic if there were un-disabled SendRcs pointing to
-                             // the allocation of r1/r2
+let mut pre_send = SendRc::pre_send();
+pre_send.disable(&mut r1); // r1 is unusable from this point
+pre_send.disable(&mut r2); // r2 is unusable from this point
+// ready() would panic on un-disabled SendRcs pointing to the allocation of r1/r2
+let mut post_send = pre_send.ready();
 
 // move everything to a different thread
 std::thread::spawn(move || {
     // both pointers are unusable here
-    send.enable(&mut r1); // r1 is usable from this point
-    send.enable(&mut r2); // r2 is usable from this point
+    post_send.enable(&mut r1); // r1 is usable from this point
+    post_send.enable(&mut r2); // r2 is usable from this point
     *r1.borrow_mut() += 1;
     assert_eq!(*r2.borrow(), 2);
 })

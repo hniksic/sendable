@@ -40,17 +40,17 @@ static ID_NEXT: AtomicUsize = AtomicUsize::new(0);
 /// let mut r2 = SendRc::clone(&r1);
 ///
 /// // prepare to ship them off to a different thread
-/// let mut send = SendRc::pre_send();
-/// send.disable(&mut r1); // r1 is unusable from this point
-/// send.disable(&mut r2); // r2 is unusable from this point
-/// let mut send = send.ready(); // would panic if there were un-disabled SendRcs pointing to
-///                              // the allocation of r1/r2
+/// let mut pre_send = SendRc::pre_send();
+/// pre_send.disable(&mut r1); // r1 is unusable from this point
+/// pre_send.disable(&mut r2); // r2 is unusable from this point
+/// // ready() would panic on un-disabled SendRcs pointing to the allocation of r1/r2
+/// let mut post_send = pre_send.ready();
 ///
 /// // move everything to a different thread
 /// std::thread::spawn(move || {
 ///     // both pointers are unusable here
-///     send.enable(&mut r1); // r1 is usable from this point
-///     send.enable(&mut r2); // r2 is usable from this point
+///     post_send.enable(&mut r1); // r1 is usable from this point
+///     post_send.enable(&mut r2); // r2 is usable from this point
 ///     *r1.borrow_mut() += 1;
 ///     assert_eq!(*r2.borrow(), 2);
 /// })
@@ -138,13 +138,13 @@ impl<T> SendRc<T> {
     /// # use sendable::SendRc;
     /// let mut r1 = SendRc::new(RefCell::new(1));
     /// let mut r2 = SendRc::clone(&r1);
-    /// let mut send = SendRc::pre_send();
-    /// send.disable(&mut r1);
-    /// send.disable(&mut r2);
-    /// let mut send = send.ready();
+    /// let mut pre_send = SendRc::pre_send();
+    /// pre_send.disable(&mut r1);
+    /// pre_send.disable(&mut r2);
+    /// let mut post_send = pre_send.ready();
     /// // send, r1, and r2 can now be send to a different thread, and re-enabled
-    /// // by calling send.enable(&mut r1) and send.enable(&mut r2)
-    /// # send.enable(&mut r1); send.enable(&mut r2); // avoid panic in doctest
+    /// // by calling post_send.enable(&mut r1) and post_send.enable(&mut r2)
+    /// # post_send.enable(&mut r1); post_send.enable(&mut r2); // avoid panic in doctest
     /// ```
     pub fn pre_send() -> PreSend<T> {
         PreSend {
@@ -270,15 +270,15 @@ impl<T> PreSend<T> {
     /// let mut r2 = SendRc::clone(&r1);
     /// let mut q1 = SendRc::new(RefCell::new(1));
     /// let mut q2 = SendRc::clone(&q1);
-    /// let mut send = SendRc::pre_send();
-    /// send.disable(&mut r1);
-    /// assert!(send.all_disabled() == false); // r2 not disabled
-    /// send.disable(&mut r2);
-    /// assert!(send.all_disabled() == true); // r1/r2 allocation fully disabled, q1/q2 doesn't participate
-    /// send.disable(&mut q1);
-    /// assert!(send.all_disabled() == false); // r1/r2 ok, but q2 not disabled
-    /// send.disable(&mut q2);
-    /// assert!(send.all_disabled() == true); // both r1/r2 allocations and q1/q2 allocations fully disabled
+    /// let mut pre_send = SendRc::pre_send();
+    /// pre_send.disable(&mut r1);
+    /// assert!(pre_send.all_disabled() == false); // r2 not disabled
+    /// pre_send.disable(&mut r2);
+    /// assert!(pre_send.all_disabled() == true); // r1/r2 allocation fully disabled, q1/q2 doesn't participate
+    /// pre_send.disable(&mut q1);
+    /// assert!(pre_send.all_disabled() == false); // r1/r2 ok, but q2 not disabled
+    /// pre_send.disable(&mut q2);
+    /// assert!(pre_send.all_disabled() == true); // both r1/r2 allocations and q1/q2 allocations fully disabled
     /// # std::mem::forget([r1, r2, q1, q2]);
     /// ```
     pub fn all_disabled(&self) -> bool {
@@ -575,10 +575,10 @@ mod tests {
     fn ok_send() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
-        let mut send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
+        let mut post_send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
 
         std::thread::spawn(move || {
-            send.enable_many([&mut r1, &mut r2]);
+            post_send.enable_many([&mut r1, &mut r2]);
             *r1.borrow_mut() += 1;
             assert_eq!(*r2.borrow(), 2);
         })
@@ -590,10 +590,10 @@ mod tests {
     fn send_and_return() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
-        let mut send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
-        let (mut send, mut r1, mut r2) = std::thread::spawn(move || {
-            send.enable_many([&mut r1, &mut r2]);
-            assert!(send.all_enabled());
+        let mut post_send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
+        let (mut post_send, mut r1, mut r2) = std::thread::spawn(move || {
+            post_send.enable_many([&mut r1, &mut r2]);
+            assert!(post_send.all_enabled());
             *r1.borrow_mut() += 1;
             assert_eq!(*r2.borrow(), 2);
             let send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
@@ -601,8 +601,8 @@ mod tests {
         })
         .join()
         .unwrap();
-        send.enable_many([&mut r1, &mut r2]);
-        assert!(send.all_enabled());
+        post_send.enable_many([&mut r1, &mut r2]);
+        assert!(post_send.all_enabled());
         assert_eq!(*r2.borrow(), 2);
     }
 
@@ -634,9 +634,9 @@ mod tests {
     fn incomplete_pre_send() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let _r2 = SendRc::clone(&r1);
-        let mut send = SendRc::pre_send();
-        send.disable(&mut r1);
-        let _ = send.ready(); // panics because we didn't disable _r2
+        let mut pre_send = SendRc::pre_send();
+        pre_send.disable(&mut r1);
+        let _ = pre_send.ready(); // panics because we didn't disable _r2
     }
 
     #[test]
@@ -646,11 +646,11 @@ mod tests {
         let mut r2 = SendRc::clone(&r1);
         let mut q1 = SendRc::new(RefCell::new(1));
         let _q2 = SendRc::clone(&q1);
-        let mut send = SendRc::pre_send();
-        send.disable(&mut r1);
-        send.disable(&mut r2);
-        send.disable(&mut q1);
-        let _ = send.ready(); // _q2 is missing
+        let mut pre_send = SendRc::pre_send();
+        pre_send.disable(&mut r1);
+        pre_send.disable(&mut r2);
+        pre_send.disable(&mut q1);
+        let _ = pre_send.ready(); // _q2 is missing
     }
 
     #[test]
@@ -658,22 +658,22 @@ mod tests {
     fn faked_pre_send_count_reusing_same_ptr() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let _r2 = SendRc::clone(&r1);
-        let mut send = SendRc::pre_send();
+        let mut pre_send = SendRc::pre_send();
         // disabling the same SendRc twice won't fool us into thinking all instances were
         // disabled
-        send.disable(&mut r1);
-        send.disable(&mut r1);
-        let _ = send.ready();
+        pre_send.disable(&mut r1);
+        pre_send.disable(&mut r1);
+        let _ = pre_send.ready();
     }
 
     #[test]
     #[should_panic = "attempt to use disabled"]
     fn disable_same_sendrc_in_different_presend() {
         let mut r = SendRc::new(RefCell::new(1));
-        let mut send1 = SendRc::pre_send();
-        send1.disable(&mut r);
-        let mut send2 = SendRc::pre_send();
-        send2.disable(&mut r);
+        let mut pre_send1 = SendRc::pre_send();
+        pre_send1.disable(&mut r);
+        let mut pre_send2 = SendRc::pre_send();
+        pre_send2.disable(&mut r);
         std::mem::forget(r); // prevent panic on drop
     }
 
@@ -681,15 +681,15 @@ mod tests {
     fn enable_same_send_diff_threads() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
-        let mut send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
-        let mut send = std::thread::spawn(move || {
-            send.enable(&mut r1);
-            send
+        let mut post_send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
+        let mut post_send = std::thread::spawn(move || {
+            post_send.enable(&mut r1);
+            post_send
         })
         .join()
         .unwrap();
         let result = std::thread::spawn(move || {
-            send.enable(&mut r2);
+            post_send.enable(&mut r2);
         })
         .join();
         assert!(result.is_err());
@@ -700,12 +700,12 @@ mod tests {
         let state = Arc::new(Mutex::new(0));
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
-        let mut send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
+        let mut post_send = SendRc::pre_send_disable_all([&mut r1, &mut r2]);
         let result = std::thread::spawn({
             let state = state.clone();
             move || {
                 *state.lock().unwrap() = 1;
-                send.enable(&mut r1);
+                post_send.enable(&mut r1);
                 *state.lock().unwrap() = 2;
                 *r1.borrow_mut() = 2;
                 *state.lock().unwrap() = 3;
@@ -722,15 +722,15 @@ mod tests {
     fn enable_undisabled() {
         let state = Arc::new(Mutex::new(0));
         let mut r1 = SendRc::new(RefCell::new(1));
-        let mut send = SendRc::pre_send_disable_all([&mut r1]);
+        let mut post_send = SendRc::pre_send_disable_all([&mut r1]);
         let result = std::thread::spawn({
             let state = state.clone();
             move || {
                 *state.lock().unwrap() = 1;
-                send.enable(&mut r1);
+                post_send.enable(&mut r1);
                 let mut rogue = SendRc::clone(&r1);
                 *state.lock().unwrap() = 2;
-                send.enable(&mut rogue); // should panic
+                post_send.enable(&mut rogue); // should panic
                 *state.lock().unwrap() = 3;
             }
         })
@@ -742,11 +742,11 @@ mod tests {
     #[test]
     fn enable_twice() {
         let mut r1 = SendRc::new(RefCell::new(1));
-        let mut send = SendRc::pre_send_disable_all([&mut r1]);
+        let mut post_send = SendRc::pre_send_disable_all([&mut r1]);
         std::thread::spawn(move || {
-            send.enable(&mut r1);
-            send.enable(&mut r1);
-            send.enable(&mut r1);
+            post_send.enable(&mut r1);
+            post_send.enable(&mut r1);
+            post_send.enable(&mut r1);
         })
         .join()
         .unwrap();
@@ -756,11 +756,11 @@ mod tests {
     fn disable_twice_good() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::new(RefCell::new(1));
-        let mut send = SendRc::pre_send();
-        send.disable(&mut r1);
-        send.disable(&mut r1);
-        send.disable(&mut r2);
-        let _ = send.ready();
+        let mut pre_send = SendRc::pre_send();
+        pre_send.disable(&mut r1);
+        pre_send.disable(&mut r1);
+        pre_send.disable(&mut r2);
+        let _ = pre_send.ready();
         // avoid panic on drop
         std::mem::forget([r1, r2]);
     }
@@ -773,14 +773,14 @@ mod tests {
             move || {
                 let mut r1 = SendRc::new(RefCell::new(1));
                 let mut r2 = SendRc::new(RefCell::new(1));
-                let mut send1 = SendRc::pre_send();
-                let mut send2 = SendRc::pre_send();
+                let mut pre_send1 = SendRc::pre_send();
+                let mut pre_send2 = SendRc::pre_send();
                 *state.lock().unwrap() = 1;
-                send1.disable(&mut r1);
+                pre_send1.disable(&mut r1);
                 *state.lock().unwrap() = 2;
-                send1.disable(&mut r2);
+                pre_send1.disable(&mut r2);
                 *state.lock().unwrap() = 3;
-                send2.disable(&mut r2); // panic
+                pre_send2.disable(&mut r2); // panic
                 *state.lock().unwrap() = 4;
             }
         })
