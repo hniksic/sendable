@@ -27,4 +27,4 @@ mod thread_id;
 mod deepsize;
 
 pub use send_opt::SendOption;
-pub use send_rc::SendRc;
+pub use send_rc::{PostSendRc, PreSendRc, SendRc};

@@ -68,8 +68,8 @@ pub struct SendRc<T> {
     ptr: NonNull<Inner<T>>,
     // Associate an non-changing id with each pointer so that we can track how many have
     // participated in migration. If malicious code forces wrap-around of the id, we're
-    // still sound because passing two SendRcs with the same id to `PreSend::disable()`
-    // will just cause `PreSend::ready()` to always fail and prevent migration.
+    // still sound because passing two SendRcs with the same id to `PreSendRc::disable()`
+    // will just cause `PreSendRc::ready()` to always fail and prevent migration.
     id: usize,
 }
 
@@ -148,8 +148,8 @@ impl<T> SendRc<T> {
     /// // by calling post_send.enable(&mut r1) and post_send.enable(&mut r2)
     /// # post_send.enable(&mut r1); post_send.enable(&mut r2); // avoid panic in doctest
     /// ```
-    pub fn pre_send() -> PreSend<T> {
-        PreSend {
+    pub fn pre_send() -> PreSendRc<T> {
+        PreSendRc {
             disabled: HashMap::new(),
         }
     }
@@ -157,13 +157,13 @@ impl<T> SendRc<T> {
     /// Prepare to send a fixed collection of `SendRc`s to a different thread.
     ///
     /// Calls `SendRc::pre_send()`, then `disable()` on the provided `SendRc`s, then
-    /// finishes the pre-send phase with a call to `ready()`. Returns the `PostSend` token
+    /// finishes the pre-send phase with a call to `ready()`. Returns the `PostSendRc` token
     /// which to send to the new thread along with the `SendRc`s and use to re-enable the
     /// `SendRc`s.
     ///
     /// Panics if there are allocations pointed to by `SendRc`s in `all` which have extra
     /// `SendRc`s not included in `all`.
-    pub fn pre_send_ready<'a>(all: impl IntoIterator<Item = &'a mut Self>) -> PostSend<T>
+    pub fn pre_send_ready<'a>(all: impl IntoIterator<Item = &'a mut Self>) -> PostSendRc<T>
     where
         T: 'a,
     {
@@ -223,11 +223,11 @@ impl<T> SendRc<T> {
 /// This handle cannot be sent to a different thread; when done with calls to `disable()`,
 /// invoke `ready()` to obtain a token that can be moved to the other thread to re-enable
 /// the `SendRc`s.
-pub struct PreSend<T> {
+pub struct PreSendRc<T> {
     disabled: HashMap<usize, NonNull<Inner<T>>>,
 }
 
-impl<T> PreSend<T> {
+impl<T> PreSendRc<T> {
     /// Make `send_rc` temporarily unusable so it can be sent to another thread.
     ///
     /// After this call it is no longer possible to deref, clone, or drop this `SendRc`.
@@ -245,7 +245,7 @@ impl<T> PreSend<T> {
         // If send_rc.ptr is dangling, it means the send_rc was already disabled in
         // another SendRc.  This is a programming error, and will be caught by
         // assert_pinned_and_valid().
-        send_rc.assert_pinned_and_valid("PreSend::disable()");
+        send_rc.assert_pinned_and_valid("PreSendRc::disable()");
         self.disabled.insert(send_rc.id, send_rc.ptr);
         send_rc.ptr = NonNull::dangling();
     }
@@ -293,7 +293,7 @@ impl<T> PreSend<T> {
                 });
         ptr_sendrc_cnt.into_iter().all(|(ptr, cnt)| {
             // Safety: allocation is valid because there is at least 1 SendRc pointing to
-            // it. We may access it from this thread because PreSend isn't Send.
+            // it. We may access it from this thread because PreSendRc isn't Send.
             let inner = unsafe { &*ptr.as_ptr() };
             cnt == inner.strong_count.get()
         })
@@ -306,11 +306,11 @@ impl<T> PreSend<T> {
     ///
     /// Panics if there are outstanding `SendRc`s we haven't yet disabled, i.e. if
     /// `all_disabled()` would return false.
-    pub fn ready(self) -> PostSend<T> {
+    pub fn ready(self) -> PostSendRc<T> {
         if !self.all_disabled() {
-            panic!("PreSend::ready() called before all SendRcs have been disabled");
+            panic!("PreSendRc::ready() called before all SendRcs have been disabled");
         }
-        PostSend {
+        PostSendRc {
             disabled: self.disabled,
             enabled: HashSet::new(),
             prev_thread: current_thread(),
@@ -320,21 +320,21 @@ impl<T> PreSend<T> {
 
 /// Handle for enabling the `SendRc`s after they are sent to another thread.
 ///
-/// Since `PostSend` can only be obtained via `PreSend::ready()`, possessing a `PostSend`
+/// Since `PostSendRc` can only be obtained via `PreSendRc::ready()`, possessing a `PostSendRc`
 /// serves as proof that all `SendRc`s belonging to the allocations involved in the move
 /// have been disabled.
 #[must_use]
-pub struct PostSend<T> {
+pub struct PostSendRc<T> {
     disabled: HashMap<usize, NonNull<Inner<T>>>,
     enabled: HashSet<usize>,
     prev_thread: u64,
 }
 
-// Safety: pointers to allocations can be sent to a new thread because PreSend::ready()
+// Safety: pointers to allocations can be sent to a new thread because PreSendRc::ready()
 // checked that all their SendRcs have been disabled.
-unsafe impl<T> Send for PostSend<T> where T: Send {}
+unsafe impl<T> Send for PostSendRc<T> where T: Send {}
 
-impl<T> PostSend<T> {
+impl<T> PostSendRc<T> {
     /// Make `send_rc` usable again after having moved it to a new thread.
     pub fn enable(&mut self, send_rc: &mut SendRc<T>) {
         if self.enabled.contains(&send_rc.id) {
@@ -342,22 +342,22 @@ impl<T> PostSend<T> {
             return;
         }
         if send_rc.ptr != NonNull::dangling() {
-            panic!("PostSend::enable() called on a non-disabled SendRc");
+            panic!("PostSendRc::enable() called on a non-disabled SendRc");
         }
-        // This will panic if the SendRc was disabled by another PreSend.
+        // This will panic if the SendRc was disabled by another PreSendRc.
         let ptr = self
             .disabled
             .get(&send_rc.id)
             .copied()
-            .expect("PostSend::enable() called on a SendRc disabled elsewhere");
+            .expect("PostSendRc::enable() called on a SendRc disabled elsewhere");
         // Safety: SendRc guarantees that the pointer points to valid allocation.
         let inner = unsafe { &*ptr.as_ptr() };
-        // Check previously pinned thread in case someone sends PostSend to another
+        // Check previously pinned thread in case someone sends PostSendRc to another
         // thread, enables a pointer, and then sends it to a third thread and enables
         // another one.
         let old_pinned_to = inner.pinned_to.load(Ordering::Relaxed);
         if old_pinned_to != self.prev_thread && old_pinned_to != current_thread() {
-            panic!("PostSend::enable() called from different threads");
+            panic!("PostSendRc::enable() called from different threads");
         }
         // We can get away with load+store without CAS because this can't happen in
         // parallel, since we take &mut self.
