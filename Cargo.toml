@@ -1,11 +1,11 @@
 [package]
 name = "sendable"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Hrvoje Nikšić <hniksic@gmail.com>"]
 license = "Apache-2.0/MIT"
-repository = "https://github.com/hniksic/send-rc"
-homepage = "https://github.com/hniksic/send-rc"
+repository = "https://github.com/hniksic/sendable"
+homepage = "https://github.com/hniksic/sendable"
 documentation = "https://docs.rs/sendable/"
 keywords = ["thread", "rc", "send", "option"]
 description = "Rc and Option equivalents that facilitate sending data between threads."
