@@ -392,12 +392,15 @@ impl<T> PostSend<T> {
         // thread, enables a pointer, and then sends it to a third thread and enables
         // another one.
         let old_pinned_to = inner.pinned_to.load(Ordering::Relaxed);
-        if old_pinned_to != 0 && old_pinned_to != current_thread {
-            panic!("PostSend::enable() called from different threads");
+        if old_pinned_to == 0 {
+            // We can get away with load+store without CAS because this can't happen in
+            // parallel, since we take &mut self.
+            inner.pinned_to.store(current_thread, Ordering::Relaxed);
+        } else {
+            // Since we check that enable() is always called from the same thread, it
+            // shouldn't be possible for the allocation to be pinned to some other thread.
+            assert_eq!(old_pinned_to, current_thread);
         }
-        // We can get away with load+store without CAS because this can't happen in
-        // parallel, since we take &mut self.
-        inner.pinned_to.store(current_thread, Ordering::Relaxed);
         send_rc.ptr = ptr;
         self.enabled.insert(send_rc.id);
     }
