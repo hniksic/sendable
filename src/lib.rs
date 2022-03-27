@@ -8,7 +8,7 @@
 //! Both types rely on run-time checks to enforce Rust's safety guarantees. `SendRc`
 //! requires the pointers to be disabled before being sent to a different thread, and
 //! re-enabled after. `SendOption` requires the option to be set to `None` before being
-//! sent to another thread, and then to be explicitly marked as sent.
+//! sent to another thread, and then to be explicitly migrated before use.
 //!
 //! `SendRc` is designed for constructing single-threaded hierarchies that support data
 //! sharing and interior mutability (`Cell` and `RefCell`), and which needs to be

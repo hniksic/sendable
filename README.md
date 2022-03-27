@@ -14,7 +14,7 @@ You might consider `SendRc` if:
 
 * your values form an acyclic graph or a hierarchy with cross-references;
 * you build and use the hierarchy from a single thread;
-* need to occasionally move the whole thing to another thread.
+* you need to occasionally move the whole thing to another thread.
 
 Within the confines of a single thread, using `Rc` and `RefCell` to represent acyclic
 graphs and data sharing is ergonomic and safe. It is also efficient because
@@ -24,14 +24,14 @@ away where they are not globally observable.
 
 In programs that process many such graphs it comes in very useful to be able to create
 them in one thread and ship them to another for processing (and possibly to a third one
-for destruction). After all, types like `RefCell` and `Cell` are `Send` - they provide
-interior mutability, but no sharing. The trouble is with `Rc`, which is neither `Send` nor
-`Sync`, and for good reason. Even when it would be perfectly safe to move an entire
-hierarchy of `Rc<RefCell<T>>`s from one thread to another, the borrow checker doesn't
-allow it because it cannot statically prove that you have moved _all_ of them. If some
-`Rc`s pointing to the data that was moved to a new thread remained in the original thread,
-the unsynchronized manipulation to the contents and the reference counts would exhibit
-undefined behavior and wreak havoc.
+for destruction). Given that types like `RefCell` and `Cell` are `Send`, the idea is not
+unthinkable. The trouble is with `Rc`, which is neither `Send` nor `Sync`, and for good
+reason. Even though it would be perfectly safe to move an entire hierarchy of
+`Rc<RefCell<T>>`s from one thread to another, the borrow checker doesn't allow it because
+it cannot statically prove that you have moved _all_ of them. If some `Rc`s pointing to
+shared data remained in the original thread, unsynchronized access to the non-`Sync` cells
+and unsynchronized manipulation of the reference counts would be undefined behavior and
+wreak havoc.
 
 If there were a way to demonstrate to Rust that you've sent all pointers to a particular
 allocation to a different thread, there would be no problem in moving `Rc<T>` instances to
@@ -101,8 +101,8 @@ calls into the pthread API. It also increases the memory overhead because it req
 extra allocation for the system mutex. Even the most efficient mutex implementations like
 `parking_lot` don't come for free, and bear the cost of atomic synchronization. But even
 disregarding the cost, the issue is also conceptual: it is simply wrong to use
-`Arc<Mutex<T>>` if neither `Arc` nor `Mutex` is actually needed because the code *doesn't*
-access the value of `T` from multiple threads in parallel.
+`Arc<Mutex<T>>` if neither `Arc` nor `Mutex` are actually needed because the code
+*doesn't* access the value of `T` from multiple threads in parallel.
 
 In summary, `SendRc<T>` is `Send`, with certains guarantees enforced at run time, the same
 way an `Arc<Mutex<T>>` is `Send + Sync`, with certain guarantees enforced at run
@@ -127,7 +127,7 @@ Finally, one can avoid the arena by just using `unsafe impl Send` on a root type
 used to send the whole world to the new thread, and borrow checker be damned. That
 solution is hacky and gives up the guarantees afforded by Rust. If you make a mistake, say
 by leaving an `Rc` clone in the original thread, you're back to core dumps like in C++. In
-Rust we hope to do better, and `SendRc` is an attempt to make such a sound solution that
+Rust we hope to do better, and `SendRc` is intended to provide a sound solution that
 addresses this scenario.
 
 ## What about SendOption?
@@ -145,10 +145,10 @@ shallow-copied and forgotten, and that's safe.
 
 `SendOption` is designed for types which are composed of `Send` data, except for an
 optional field of a non-send type. The field is set and used only inside a particular
-thread, and will be `None` while sent across threads, but since Rust can't prove that, a
-field of `Option<NonSendType>` makes the entire outer type not `Send`. For example, a
-field with a `SendOption<Rc<Arena>>` could be used to create a `Send` type that refers to
-a single-threaded arena.
+thread, and will be `None` while being sent across threads, but since Rust can't prove
+that, a field of `Option<NonSendType>` makes the entire outer type not `Send`. For
+example, a field with a `SendOption<Rc<Arena>>` could be used to create a `Send` type that
+refers to a single-threaded arena.
 
 ## Is this really safe?
 
@@ -159,7 +159,7 @@ settling on the current approach and, while I did find the occasional issue, the
 underlying idea held up under scrutiny. MIRI finds no undefined behavior while running the
 tests.
 
-You are invited to review at the code - it is not large - and report any issues you
+You are invited to review the code - it is not large - and report any issues you
 encounter.
 
 ## Are the run-time checks expensive?
@@ -179,7 +179,7 @@ to another thread while there is an outstanding reference.) `SendRc::clone()` an
 the pinned-to thread, the same as in `SendRc`.
 
 Regarding memory usage, `SendRc`'s heap overhead is two machine words, the same as that of
-an `Rc` (but `SendRc` doesn't support weak references). Additoinally, each individual
+an `Rc` (but `SendRc` doesn't support weak references). Additionally, each individual
 `SendRc` is two machine words wide because it has to carry an identity of the pointer.
 `SendOption` stores a `u64` alongside the underlying option.
 

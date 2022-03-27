@@ -1,11 +1,11 @@
 //! Container like `Option<T>`, but `Send` even if `T` is not `Send`.
 //!
 //! [`SendOption`] is useful for types which are composed of `Send` data, except for an
-//! optional field of a non-send type. The field is set and used only inside a particular
-//! thread, and will be `None` while sent across threads, but since Rust can't prove that,
-//! a field of `Option<NonSendType>` makes the entire outer type not `Send`. For example,
-//! a field with a `SendOption<Rc<Arena>>` could be used to create a `Send` type that
-//! refers to a single-threaded arena.
+//! optional field of a non-send type. The field is expected to be set and used only
+//! inside a particular thread, and will be `None` while sent across the thread
+//! boundary. Since Rust can't prove any of that, using `Option<NonSendType>` for the
+//! field prevents the entire type from being `Send`. `SendOption` enforces the above
+//! guarantees at run time.
 
 use std::fmt::Debug;
 use std::mem::ManuallyDrop;
@@ -19,7 +19,7 @@ use crate::thread_id::current_thread;
 /// This is sound because we require `SendOption` to be `None` when transferred across
 /// thread boundary, so `T` values are never actually moved across threads.  If this is
 /// violated by sending a non-`None` `SendOption` to another thread, access to its
-/// contents (including through drop) will be detected and prevented with panic.
+/// contents (including through drop) will be detected and prevented by panicking.
 ///
 /// To migrate `SendOption` to another thread, set it to `None`, send it across, and call
 /// [`post_send()`](SendOption::post_send) to use it normally.
