@@ -7,7 +7,7 @@ license = "Apache-2.0/MIT"
 repository = "https://github.com/hniksic/sendable"
 homepage = "https://github.com/hniksic/sendable"
 documentation = "https://docs.rs/sendable/"
-keywords = ["thread", "rc", "send", "option"]
+keywords = ["graph", "rc", "thread", "option"]
 description = "Rc and Option equivalents that facilitate sending data between threads."
 
 [dependencies]
