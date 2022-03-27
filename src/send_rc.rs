@@ -329,10 +329,17 @@ impl<T> PreSend<T> {
         if !self.all_disabled() {
             panic!("PreSend::ready() called before all SendRcs have been disabled");
         }
+        // Pin allocations to a non-existent thread id, so that enable() can detect the
+        // new thread from which we are called (even if that new thread is the current
+        // thread again).
+        for &ptr in self.disabled.values() {
+            // Safety: ptr belongs to a SendRc, so it's valid
+            let inner = unsafe { &*ptr.as_ptr() };
+            inner.pinned_to.store(0, Ordering::Relaxed);
+        }
         PostSend {
             disabled: self.disabled,
             enabled: HashSet::new(),
-            prev_thread: current_thread(),
         }
     }
 }
@@ -346,7 +353,6 @@ impl<T> PreSend<T> {
 pub struct PostSend<T> {
     disabled: HashMap<usize, NonNull<Inner<T>>>,
     enabled: HashSet<usize>,
-    prev_thread: u64,
 }
 
 // Safety: pointers to allocations can be sent to a new thread because PreSend::ready()
@@ -375,7 +381,7 @@ impl<T> PostSend<T> {
         // thread, enables a pointer, and then sends it to a third thread and enables
         // another one.
         let old_pinned_to = inner.pinned_to.load(Ordering::Relaxed);
-        if old_pinned_to != self.prev_thread && old_pinned_to != current_thread() {
+        if old_pinned_to != 0 && old_pinned_to != current_thread() {
             panic!("PostSend::enable() called from different threads");
         }
         // We can get away with load+store without CAS because this can't happen in
