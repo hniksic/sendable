@@ -172,6 +172,11 @@ impl<T> SendRc<T> {
         send.ready()
     }
 
+    /// Returns true if this `SendRc` has been disabled for sending to a new thread.
+    pub fn is_sendrc_disabled(&self) -> bool {
+        self.ptr == NonNull::dangling()
+    }
+
     /// Returns the number of pointers to this allocation.
     ///
     /// Panics when invoked from a different thread than the one the `SendRc` was created
