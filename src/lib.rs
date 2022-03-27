@@ -24,12 +24,12 @@
 
 #![warn(missing_docs)]
 
-mod send_opt;
-mod send_rc;
-mod thread_id;
+pub mod send_opt;
+pub mod send_rc;
 
 #[cfg(feature = "deepsize")]
 mod deepsize;
+mod thread_id;
 
 pub use send_opt::SendOption;
-pub use send_rc::{PostSendRc, PreSendRc, SendRc};
+pub use send_rc::SendRc;

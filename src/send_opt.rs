@@ -1,3 +1,12 @@
+//! Container like `Option<T>`, but `Send` even if `T` is not `Send`.
+//!
+//! [`SendOption`] is useful for types which are composed of `Send` data, except for an
+//! optional field of a non-send type. The field is set and used only inside a particular
+//! thread, and will be `None` while sent across threads, but since Rust can't prove that,
+//! a field of `Option<NonSendType>` makes the entire outer type not `Send`. For example,
+//! a field with a `SendOption<Rc<Arena>>` could be used to create a `Send` type that
+//! refers to a single-threaded arena.
+
 use std::fmt::Debug;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
