@@ -8,7 +8,6 @@
 //! guarantees at run time.
 
 use std::fmt::Debug;
-use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,16 +15,17 @@ use crate::thread_id::current_thread;
 
 /// Like `Option<T>`, but `Send` even if `T` is not `Send`.
 ///
-/// This is sound because we require `SendOption` to be `None` when transferred across
-/// thread boundary, so `T` values are never actually moved across threads.  If this is
-/// violated by sending a non-`None` `SendOption` to another thread, access to its
-/// contents (including through drop) will be detected and prevented by panicking.
+/// This is sound because we require `SendOption` to be `None` when transferred across a
+/// thread boundary.  If this is violated and a non-`None` `SendOption` is accessed in a
+/// foreign thread, access to its contents (including through drop) is prevented by means
+/// of panic.
 ///
 /// To migrate `SendOption` to another thread, set it to `None`, send it across, and call
-/// [`post_send()`](SendOption::post_send) to use it normally.
+/// [`post_send()`](SendOption::post_send) to pin it to the new thread and use it
+/// normally.
 pub struct SendOption<T> {
     pinned_to: AtomicU64,
-    inner: ManuallyDrop<Option<T>>,
+    inner: Option<T>,
 }
 
 // Safety: we don't allow a T to be sent to another thread and accessed there in any way.
@@ -36,7 +36,7 @@ impl<T> SendOption<T> {
     pub fn new(val: Option<T>) -> Self {
         SendOption {
             pinned_to: AtomicU64::new(current_thread()),
-            inner: ManuallyDrop::new(val),
+            inner: val,
         }
     }
 
@@ -51,7 +51,7 @@ impl<T> SendOption<T> {
         }
     }
 
-    /// Called after the option has been sent to another thread.
+    /// Call this after moving the option to another thread.
     ///
     /// This will panic if the option is not `None`.
     pub fn post_send(&mut self) {
@@ -80,13 +80,13 @@ impl<T> DerefMut for SendOption<T> {
 
 impl<T> Drop for SendOption<T> {
     fn drop(&mut self) {
-        if self.check_pinned() {
-            // Safety: we call drop() only once, and we don't access self.inner after it.
-            unsafe {
-                ManuallyDrop::drop(&mut self.inner);
+        if !self.check_pinned() {
+            std::mem::forget(self.inner.take());
+            if !std::thread::panicking() {
+                panic!(
+                    "SendOption::drop(): attempt to use non-None SendOption from different thread"
+                );
             }
-        } else if !std::thread::panicking() {
-            panic!("SendOption::drop(): attempt to use non-None SendOption from different thread");
         }
     }
 }
@@ -127,8 +127,14 @@ mod tests {
 
     #[test]
     fn debug_impl() {
-        assert_eq!(format!("{:?}", SendOption::new(Some(0))), "SendOption(Some(0))");
-        assert_eq!(format!("{:?}", SendOption::new(None::<u32>)), "SendOption(None)");
+        assert_eq!(
+            format!("{:?}", SendOption::new(Some(0))),
+            "SendOption(Some(0))"
+        );
+        assert_eq!(
+            format!("{:?}", SendOption::new(None::<u32>)),
+            "SendOption(None)"
+        );
     }
 
     #[test]
