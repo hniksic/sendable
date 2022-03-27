@@ -21,7 +21,11 @@ static ID_NEXT: AtomicUsize = AtomicUsize::new(0);
 
 /// Reference-counting pointer like `Rc<T>`, but which is `Send` if `T` is `Send`.
 ///
-/// This is different from `Arc` because the value can still be accessed from only one
+/// This type is handy if you use `Rc` to create an acyclic graph or a hierarchy with
+/// cross-references, which you build and use from a single thread, but which you need to
+/// occasionally move to another thread wholesale.
+///
+/// It is different from `Arc` because the value can still be accessed from only one
 /// thread at a time, and it is only allowed to manipulate it (by dropping or cloning)
 /// from a single thread. This property makes it `Send` even when holding non-`Sync` types
 /// like `RefCell`.
@@ -57,6 +61,11 @@ static ID_NEXT: AtomicUsize = AtomicUsize::new(0);
 /// .join()
 /// .unwrap();
 /// ```
+///
+/// If the `SendRc`s are edges in a graph, you'll need to visit the whole graph before and
+/// after the migration to the new thread. In the pre-send phase you'll need to disable the
+/// pointer after visiting its neighbors, whereas in the post-send step you'll need to first
+/// re-enable the pointer and then visit the neighbors.
 ///
 /// Compared to `Rc`, tradeoffs are:
 ///

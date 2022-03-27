@@ -10,7 +10,7 @@ The `sendable` crate defines types to facilitate sending data between threads:
 
 ## When is SendRc useful?
 
-You might consider using `SendRc` if:
+You might consider `SendRc` if:
 
 * your values form an acyclic graph or a hierarchy with cross-references;
 * you build and use the hierarchy from a single thread;
@@ -18,19 +18,19 @@ You might consider using `SendRc` if:
 
 Within the confines of a single thread, using `Rc` and `RefCell` to represent acyclic
 graphs and data sharing is ergonomic and safe. It is also efficient because
-single-threaded manipulation doesn't require atomics or locks, making `deref()` trivial,
-and allowing the compiler to inline `borrow()` and `borrow_mut()` and even optimize them
+single-threaded manipulation doesn't require atomics or locks, makes `deref()` trivial,
+and allows the compiler to inline `borrow()` and `borrow_mut()` and even optimize them
 away where they are not globally observable.
 
-In programs that process many such graphs it comes very useful to be able to create them
-in one thread and then use them in another (and possibly destroy them in a separate one).
-After all, types like `RefCell` and `Cell` are `Send` - they provide interior mutability,
-but no sharing. The trouble is with `Rc`, which is neither `Send` nor `Sync`, and for good
-reason. Even when it would be perfectly safe to move an entire hierarchy of
-`Rc<RefCell<T>>`s from one thread to another, the borrow checker doesn't allow it because
-it cannot statically prove that you have moved _all_ of them. If some `Rc`s pointing to
-the data that was moved to a new thread remained in the original thread, the
-unsynchronized manipulation to the contents and the reference counts would exhibit
+In programs that process many such graphs it comes in very useful to be able to create
+them in one thread and ship them to another for processing (and possibly to a third one
+for destruction). After all, types like `RefCell` and `Cell` are `Send` - they provide
+interior mutability, but no sharing. The trouble is with `Rc`, which is neither `Send` nor
+`Sync`, and for good reason. Even when it would be perfectly safe to move an entire
+hierarchy of `Rc<RefCell<T>>`s from one thread to another, the borrow checker doesn't
+allow it because it cannot statically prove that you have moved _all_ of them. If some
+`Rc`s pointing to the data that was moved to a new thread remained in the original thread,
+the unsynchronized manipulation to the contents and the reference counts would exhibit
 undefined behavior and wreak havoc.
 
 If there were a way to demonstrate to Rust that you've sent all pointers to a particular
