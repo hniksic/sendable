@@ -340,6 +340,7 @@ impl<T> PreSend<T> {
         PostSend {
             disabled: self.disabled,
             enabled: HashSet::new(),
+            new_thread: 0,
         }
     }
 }
@@ -353,6 +354,7 @@ impl<T> PreSend<T> {
 pub struct PostSend<T> {
     disabled: HashMap<usize, NonNull<Inner<T>>>,
     enabled: HashSet<usize>,
+    new_thread: u64,
 }
 
 // Safety: pointers to allocations can be sent to a new thread because PreSend::ready()
@@ -362,6 +364,12 @@ unsafe impl<T> Send for PostSend<T> where T: Send {}
 impl<T> PostSend<T> {
     /// Make `send_rc` usable again after having moved it to a new thread.
     pub fn enable(&mut self, send_rc: &mut SendRc<T>) {
+        let current_thread = current_thread();
+        match self.new_thread {
+            0 => self.new_thread = current_thread,
+            id if id == current_thread => {},
+            _ => panic!("PostSend::enable() called from more than one thread"),
+        }
         if self.enabled.contains(&send_rc.id) {
             // make calling enable() twice a no-op
             return;
@@ -381,12 +389,12 @@ impl<T> PostSend<T> {
         // thread, enables a pointer, and then sends it to a third thread and enables
         // another one.
         let old_pinned_to = inner.pinned_to.load(Ordering::Relaxed);
-        if old_pinned_to != 0 && old_pinned_to != current_thread() {
+        if old_pinned_to != 0 && old_pinned_to != current_thread {
             panic!("PostSend::enable() called from different threads");
         }
         // We can get away with load+store without CAS because this can't happen in
         // parallel, since we take &mut self.
-        inner.pinned_to.store(current_thread(), Ordering::Relaxed);
+        inner.pinned_to.store(current_thread, Ordering::Relaxed);
         send_rc.ptr = ptr;
         self.enabled.insert(send_rc.id);
     }
@@ -781,5 +789,18 @@ mod tests {
         .join();
         assert!(result.is_err());
         assert_eq!(*state.lock().unwrap(), 3);
+    }
+
+    #[test]
+    #[should_panic = "enable() called from more than one thread"]
+    fn send_from_diff_threads() {
+        let mut a = SendRc::new(RefCell::new(1));
+        let mut b = SendRc::clone(&a);
+        let mut post_send = SendRc::pre_send_ready([&mut a, &mut b]);
+        let mut post_send = std::thread::spawn(move || {
+            post_send.enable(&mut a);
+            post_send
+        }).join().unwrap();
+        post_send.enable(&mut b);
     }
 }
