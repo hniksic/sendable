@@ -47,7 +47,7 @@ created in.
 When `SendRc`s needs to be moved to a different thread, each pointer is explicitly marked
 for sending using the API provided for that purpose. Once thus marked, access to
 underlying data from that pointer is prohibited, even in the original thread. When all
-pointers to an allocation disabled, they can be sent across the thread boundary, and
+pointers to an allocation are marked, they can be sent across the thread boundary, and
 explicitly re-enabled in the new thread. In a simple case of two `SendRc`s, the process
 looks like this:
 
@@ -58,27 +58,21 @@ let mut r2 = SendRc::clone(&r1);
 
 // prepare to ship them off to a different thread
 let mut pre_send = SendRc::pre_send();
-pre_send.disable(&mut r1); // r1 is unusable from this point
-pre_send.disable(&mut r2); // r2 is unusable from this point
-// ready() would panic on un-disabled SendRcs pointing to the allocation of r1/r2
+pre_send.mark_send(&mut r1); // allocation is unusable from this point
+pre_send.mark_send(&mut r2);
+// ready() would panic if there were unmarked SendRcs pointing to the allocation
 let mut post_send = pre_send.ready();
 
 // move everything to a different thread
 std::thread::spawn(move || {
     // both pointers are unusable here
-    post_send.enable(&mut r1); // r1 is usable from this point
-    post_send.enable(&mut r2); // r2 is usable from this point
+    post_send.sent(); // both are usable from this point
     *r1.borrow_mut() += 1;
     assert_eq!(*r2.borrow(), 2);
 })
 .join()
 .unwrap();
 ```
-
-If the `SendRc`s are edges in a graph, you'll need to visit the whole graph before and
-after the migration to the new thread. In the pre-send phase you'll need to disable the
-pointer after visiting its neighbors, whereas in the post-send step you'll need to first
-re-enable the pointer and then visit the neighbors.
 
 ## Why not just use Arc?
 
@@ -167,12 +161,12 @@ encounter.
 While run-time checks are certainly more expensive than in case of `Rc` and `Option` which
 don't need any, they are still quite cheap.
 
-`SendRc::deref()` just checks that the `SendRc` was not disabled (by comparing to a
-constant) and compares the id of the pinned-to thread fetched with a relaxed atomic load
-with the current thread. The relaxed atomic load compiles to an ordinary load on Intel,
+`SendRc::deref()` just compares the id of the pinned-to thread fetched with a relaxed
+atomic load with the current thread, and checks that migration isn't in progress with
+another integer comparison. The relaxed atomic load compiles to an ordinary load on Intel,
 which is as cheap as it gets, and if you're worried, you can hold on to the reference to
 avoid repeating the checks. (The borrow checker will prevent you from sending the `SendRc`
-to another thread while there is an outstanding reference.) `SendRc::clone()` and
+to another thread while there is an outstanding reference.)  `SendRc::clone()` and
 `SendRc::drop()` do the same kind of check.
 
 `SendOption::deref()` and `SendOption::deref_mut()` only check that the current thread is
