@@ -172,10 +172,10 @@ to another thread while there is an outstanding reference.)  `SendRc::clone()` a
 `SendOption::deref()` and `SendOption::deref_mut()` only check that the current thread is
 the pinned-to thread, the same as in `SendRc`.
 
-Regarding memory usage, `SendRc`'s heap overhead is two machine words, the same as that of
-an `Rc` (but `SendRc` doesn't support weak references). Additionally, each individual
-`SendRc` is two machine words wide because it has to carry an identity of the pointer.
-`SendOption` stores a `u64` alongside the underlying option.
+Regarding memory usage, `SendRc`'s heap overhead is two `u64`s for the pinning info, and a
+machine word for the reference count. An individual `SendRc` is two machine words wide
+because it has to carry an identity of the pointer. `SendOption` stores a `u64` alongside
+the underlying option.
 
 ## License
 

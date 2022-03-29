@@ -271,8 +271,9 @@ impl<T> PreSend<T> {
     /// same allocation through this `SendRc`.
     ///
     /// It is allowed to mark `SendRc`s pointing to different allocations. After calling
-    /// `mark_send()` on an as-yet-unmarked allocation, you must also invoke it on all
-    /// other `SendRc`s pointing to that allocation prior to invoking `ready()`.
+    /// `mark_send()` on a `SendRc` pointing to as-yet-unmarked allocation, you must also
+    /// invoke it on all other `SendRc`s pointing to that allocation prior to invoking
+    /// `ready()`.
     ///
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last migrated to. Also panics when passed a `send_rc` that was already
@@ -294,6 +295,32 @@ impl<T> PreSend<T> {
         }
         self.marked.insert(send_rc.id, send_rc.ptr);
         &send_rc.inner().val
+    }
+
+    /// Returns true if the `send_rc` was already marked for sending by this `PreSend`
+    /// handle.
+    ///
+    /// Panics when invoked from a different thread than the one the `SendRc` was created
+    /// in or last migrated to.
+    pub fn is_marked(&self, send_rc: &SendRc<T>) -> bool {
+        match send_rc.check_pinned() {
+            PinCheck::Ok => false,
+            PinCheck::Marking => self.marked.contains_key(&send_rc.id),
+            check @ PinCheck::BadThread => panic!("PreSend::is_marked(): {}", check.errmsg()),
+        }
+    }
+
+    /// Returns true if the allocation this `send_rc` points to was marked for sending to
+    /// another thread.
+    ///
+    /// Panics when invoked from a different thread than the one the `SendRc` was created
+    /// in or last migrated to.
+    pub fn is_allocation_marked(&self, send_rc: &SendRc<T>) -> bool {
+        match send_rc.check_pinned() {
+            PinCheck::Ok => false,
+            PinCheck::Marking => true,
+            check @ PinCheck::BadThread => panic!("PreSend::is_marked(): {}", check.errmsg()),
+        }
     }
 
     /// Returns true if there are no allocations whose `SendRc`s were passed to
