@@ -9,6 +9,38 @@
 //! from a single thread. This property makes it `Send` even when holding non-`Sync` types
 //! like `RefCell`.
 
+// Safety:
+//
+// We require `T: Send` to make SendRc<T> Send, so there is no impediment to moving T from
+// another thread, i.e. from accessing it first in one thread then in another. It's
+// accessing T from two different threads in parallel that must be prevented, since T is
+// not guaranteed to be Sync. (E.g. RefCell<u32> would cause undefined behavior if it were
+// shared among two threads.) SendRc prevents that from happening by checking at run-time
+// that access to T consistently happens from a particular thread which the value is
+// "pinned" to. By default a value and all the SendRcs are pinned to the thread T was
+// allocated in by a call to SendRc::new(). Moving a SendRc to a different thread without
+// re-pinning will cause any access to T to panic. (Manipulation of the reference count
+// through clone() and drop() from a different thread will likewise result in panic.)
+//
+// To unpin SendRc from thread A and pin it to thread B, we go through steps that ensure
+// that references to T created in thread A are relinquished before any reference to T can
+// be created in thread B:
+//
+// * We require all pointers to the allocation to be "marked" before send. We use the
+//   reference count to check that we've reached all pointers, and we disable clone and
+//   drop using panic to make sure new ones aren't created after the marking phase begins.
+// * mark_send() takes &mut SendRc, which means that existing references to T won't
+//   outlive that call.
+// * Once mark_send() returns, it is no longer possible to obtain new references to the
+//   value through any of the pointers. The only remaining way to get a T& is by calling
+//   mark_send(), and that reference is tied to the lifetime of PreSend (which is not
+//   itself Send, and must be consumed to obtain a token that is Send).
+// * To actually pin the value to thread B, the user must call PreSend::ready(), which
+//   checks that all SendRcs have been reached with mark_send() (so no T& obtained through
+//   SendRcs exist), and which consumes PreSend (so no T& obtained through mark_send()
+//   exist). The token returned by ready() is Send, and has a single method that changes
+//   the thread id which the values are pinned to.
+
 use std::borrow::Borrow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -256,29 +288,32 @@ impl<T> SendRc<T> {
     }
 }
 
-/// Handle for marking the `SendRc`s before they are sent to another thread.
+/// Registry for marking `SendRc`s so they can be sent to another thread.
 ///
-/// This handle is not `Send`; when done with calls to `mark_send()`, invoke `ready()` to
-/// obtain a token that can be moved to the other thread to re-enable the `SendRc`s.
+/// This type is not `Send`; when finished with calls to `mark_send()`, invoke `ready()`
+/// to obtain a `Send` token that can be moved to the other thread to re-enable the
+/// `SendRc`s.
 pub struct PreSend<T> {
     marked: RefCell<HashMap<usize, NonNull<Inner<T>>>>,
     pre_send_id: u64,
 }
 
 impl<T> PreSend<T> {
-    /// Make the value pointed to by `send_rc` temporarily unreachable, so it can be
-    /// safely sent to another thread.
+    /// Mark the value pointed to by `send_rc` for sending to another thread.
     ///
-    /// After this call it is no longer possible to deref, clone, or drop either this
-    /// `SendRc` or any other that points to the same shared value. However, the shared
-    /// value can be accessed reachable through the return value of this method, which may
-    /// be called again on the same `SendRc`. This allows reaching other `SendRc`s while
-    /// traversing the graph.
+    /// Calling this method is required before sending the `SendRc` to a different
+    /// thread. When the value `send_rc` points to is pointed to by other `SendRc`s,
+    /// `mark_send()` must be called on them as well.
     ///
-    /// It is allowed to call this method with `SendRc`s pointing to different shared
-    /// values. After marking a so far unmarked shared value through a `SendRc`, prior to
-    /// invoking [`ready()`](PreSend::ready) you must make sure to also mark all the other
-    /// `SendRc`s pointing to that shared value.
+    /// This makes the value pointed to by `send_rc` temporarily unreachable via the
+    /// pointers. Attempts to deref, clone, or drop either this `SendRc` or any other that
+    /// points to the same shared value will result in panic.
+    ///
+    /// It is allowed to call this method with `SendRc`s pointing to different values of
+    /// the same type. Marking the same `SendRc` more than once is a no-op.
+    ///
+    /// Returns a reference to the underlying value, which may be used to visit additional
+    /// `SendRc<T>`s that are only reachable through the value and that need to be marked.
     ///
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last migrated to. Also panics when passed a `send_rc` that was already
@@ -304,6 +339,9 @@ impl<T> PreSend<T> {
 
     /// Returns true if `send_rc` was already marked for sending by this `PreSend` handle.
     ///
+    /// This is useful for detecting a `SendRc` that was already visited while traversing
+    /// a graph of `SendRc`s.
+    ///
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last migrated to.
     pub fn is_marked(&self, send_rc: &SendRc<T>) -> bool {
@@ -315,6 +353,27 @@ impl<T> PreSend<T> {
     }
 
     /// Returns true if the shared value this `send_rc` points to was marked for sending.
+    ///
+    /// This is useful for detecting whether the value behind this `SendRc` is unreachable
+    /// through the `SendRc`s pointing to it because it was marked for sending.
+    ///
+    /// The difference between this and `is_marked()` is that `is_marked()` tests whether
+    /// the individual pointer was marked, whereas this method tests whether the value is
+    /// marked by any of the `SendRc` pointing to it:
+    ///
+    /// ```
+    /// # use std::cell::RefCell;
+    /// # use sendable::SendRc;
+    /// let mut r1 = SendRc::new(RefCell::new(1));
+    /// let mut r2 = SendRc::clone(&r1);
+    /// let pre_send = SendRc::pre_send();
+    /// pre_send.mark_send(&mut r1);
+    /// assert!(pre_send.is_marked(&r1) == true); // r1 is marked
+    /// assert!(pre_send.is_marked(&r2) == false); // r2 is not yet marked
+    /// assert!(pre_send.is_shared_value_marked(&r1) == true); // the underlying value is marked
+    /// assert!(pre_send.is_shared_value_marked(&r2) == true); // the underlying value is marked
+    /// # std::mem::forget([r1, r2]);
+    /// ```
     ///
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last migrated to.
@@ -369,11 +428,16 @@ impl<T> PreSend<T> {
         })
     }
 
-    /// Assert that all `SendRc`s pointing to shared values that are to be moved to a new
-    /// thread have been marked and return a [`PostSend`] token as proof of this check.
+    /// Assert that there are no unmarked `SendRc`s pointing to the shared values whose
+    /// `SendRc`s we've marked and return a [`PostSend`] token that proves that this was
+    /// checked.
     ///
     /// The returned token can be sent to another thread along with the `SendRc`s, and
     /// used to re-enable them with a call to [`sent()`](PostSend::sent).
+    ///
+    /// At the point of invocation of `ready()`, Rust can statically verify that there are
+    /// no outstanding references to the data pointed to by `SendRc`s involved in the
+    /// migration.
     ///
     /// Panics if the above assertion is untrue, i.e. if
     /// [`all_marked()`](PreSend::all_marked) would return false.
@@ -394,7 +458,9 @@ impl<T> PreSend<T> {
     }
 }
 
-/// Handle for enabling the `SendRc`s after they are sent to another thread.
+/// Token for migrating the `SendRc`s marked with `PreSend` to another thread.
+///
+/// The migration is effected with a call to [`sent()`](PostSend::sent()).
 ///
 /// Since `PostSend` can only be obtained via [`PreSend::ready()`], possessing a
 /// `PostSend` serves as proof that all `SendRc`s pointing to the shared values involved in
@@ -409,8 +475,10 @@ pub struct PostSend<T> {
 unsafe impl<T> Send for PostSend<T> where T: Send {}
 
 impl<T> PostSend<T> {
-    /// Re-enable all pointers involved in the move and make their data accessible from
-    /// this thread.
+    /// Migrate the values pointed to by all `SendRc`s passed to `PreSend` to the current thread.
+    ///
+    /// This re-enables all the pointers involved in the migration and makes their data
+    /// accessible from this thread.
     pub fn sent(self) {
         let current_thread = current_thread();
         for ptr in self.ptrs {
