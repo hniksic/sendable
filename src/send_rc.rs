@@ -62,7 +62,8 @@ static NEXT_PRE_SEND_ID: AtomicU64 = AtomicU64::new(1);
 /// // move everything to a different thread
 /// std::thread::spawn(move || {
 ///     // both pointers are unusable here
-///     post_send.sent(); // both are usable from this point
+///     post_send.sent();
+///     // they are usable from this point
 ///     *r1.borrow_mut() += 1;
 ///     assert_eq!(*r2.borrow(), 2);
 /// })

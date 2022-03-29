@@ -66,7 +66,8 @@ let mut post_send = pre_send.ready();
 // move everything to a different thread
 std::thread::spawn(move || {
     // both pointers are unusable here
-    post_send.sent(); // both are usable from this point
+    post_send.sent();
+    // they are usable from this point
     *r1.borrow_mut() += 1;
     assert_eq!(*r2.borrow(), 2);
 })
@@ -83,33 +84,33 @@ order for `Arc<T>` to be `Send` because if it only required `T: Send`, you could
 `borrow_mut()` from two threads on the same `RefCell` without synchronization. That is
 forbidden, and is why `Arc<RefCell<T>>` is not a thing in Rust.
 
-`SendRc` can get away with allowing this because it requires proof that all access to the
-allocated value in the previous thread was relinquished before allowing the value to be
-pinned to a new thread. `SendRc<RefCell<u32>>` is sound because if you clone it and send
-the clone to a different thread, you won't be able to access the data, nor clone or even
-drop it - any of these would result in a panic.
+`SendRc` can get away with allowing this because it guards access to the data with a check
+of the current thread. When moving data across threads, it requires proof that all access
+to the allocated value in the previous thread was relinquished prior to the move.
+`SendRc<RefCell<u32>>` is sound because if you clone it and send the clone to a different
+thread, you won't be able to access the data, nor clone or even drop it - any of those
+would result in a panic.
 
-One could fix the issue by using the full-blown `Arc<Mutex<T>>` or `Arc<RwLock<T>>`.
-However, that slows down access to data because it requires atomics, poison checks, and
-calls into the pthread API. It also increases the memory overhead because it requires an
-extra allocation for the system mutex. Even the most efficient mutex implementations like
-`parking_lot` don't come for free, and bear the cost of atomic synchronization. But even
-disregarding the cost, the issue is also conceptual: it is simply wrong to use
-`Arc<Mutex<T>>` if neither `Arc` nor `Mutex` are actually needed because the code
-*doesn't* access the value of `T` from multiple threads in parallel.
+Using the standard library, one could fix the issue by switching to the full-blown
+`Arc<Mutex<T>>` or `Arc<RwLock<T>>`.  However, that slows down access to data because it
+requires strongly-ordered atomics, poison checks, and calls into the pthread API. It also
+increases memory overhead because due to the mandatory allocation of the system mutex.
+Even the most efficient mutex implementations like `parking_lot` don't come for free and
+bear the cost of synchronization. But even disregarding the cost, on a conceptual level
+it's simply wrong to use `Arc<Mutex<T>>` if neither `Arc` nor `Mutex` are actually needed
+because the code *doesn't* access the value of `T` from multiple threads in parallel.
 
-In summary, `SendRc<T>` is `Send`, with certains guarantees enforced at run time, the same
-way an `Arc<Mutex<T>>` is `Send + Sync`, with certain guarantees enforced at run
-time. They just serve different purposes.
+In summary, `SendRc<T>` is `Send` with certains guarantees enforced at run time, the same
+way an `Arc<Mutex<T>>` is `Send + Sync` with certain guarantees enforced at run time. They
+just serve different purposes.
 
 ## Why not use an arena? Or unsafe?
 
-An arena would be an acceptable solution, but to make it `Send`, it requires the whole
-design to be devoted to that idea from the ground up. A simple solution of replacing `Rc`
-with an arena id doesn't really work because in addition to the id, the object needs a
-reference to the arena. It can't have an `Option<&Arena>` field because it would make it
-non-`Send` for an arena that contains non-`Sync` cells. Since we need `Arena` to contain
-`RefCell`, this doesn't work.
+To make an arena `Send`, the whole design must be devoted to that idea from the ground up.
+A simple solution of replacing `Rc` with an arena id doesn't really work because in
+addition to the id, the object then needs a reference to the arena. It can't have a field
+of type `Option<&Arena>` or `Option<Rc<Arena>>` because it would make the type non-`Send`
+if the arena contains `RecCell`.
 
 There are arena-based designs that do work, but require more radical changes, such as
 decoupling storage of values from access and sharing. All data is then in the arena, and
@@ -117,12 +118,12 @@ the accessors are created on-the-fly and have a lifetime connected to the lifeti
 arena. This requires dealing with the lifetime everywhere and is not easy to get right for
 non-experts.
 
-Finally, one can avoid the arena by just using `unsafe impl Send` on a root type that is
-used to send the whole world to the new thread, and borrow checker be damned. That
-solution is hacky and gives up the guarantees afforded by Rust. If you make a mistake, say
-by leaving an `Rc` clone in the original thread, you're back to core dumps like in C++. In
-Rust we hope to do better, and `SendRc` is intended to provide a sound solution that
-addresses this scenario.
+Finally, one can avoid the arena by just using `unsafe impl Send` on a wrapper type that
+is used to send the whole world to the new thread, borrow checker be damned. That solution
+is hacky and gives up the guarantees afforded by Rust. If you make a mistake, say by
+leaving an `Rc` clone in the original thread, you're facing undefined behavior and core
+dumps much like in C++. In Rust we hope to do better, and `SendRc` is intended to provide
+a sound solution that addresses this scenario.
 
 ## What about SendOption?
 
@@ -131,10 +132,10 @@ addresses this scenario.
 
 What makes it work is that `SendOption` requires you to set the value to `None` before
 sending it to another thread. If the inner `Option<T>` is `None`, it doesn't matter if `T`
-is `!Send` because no `T` is actually getting sent anywhere. If you do send a non-`None`
-`SendOption<T>` into another thread, `SendOption` will use panic to prevent you from
-accessing it in any way (including by dropping it). Failure to abide by the rules results
-in a `T` that was effectively never "sent" to another thread, only its bits were
+is not `Send` because no `T` is actually getting sent anywhere. If you do send a
+non-`None` `SendOption<T>` into another thread, `SendOption` will use panic to prevent you
+from accessing it in any way (including by dropping it). Failure to abide by the rules
+results in a `T` that was effectively never "sent" to another thread, only its bits were
 shallow-copied and forgotten, and that's safe.
 
 `SendOption` is designed for types which are composed of `Send` data, except for an
@@ -158,24 +159,24 @@ encounter.
 
 ## Are the run-time checks expensive?
 
-While run-time checks are certainly more expensive than in case of `Rc` and `Option` which
-don't need any, they are still quite cheap.
+While run-time checks performed by `SendRc` and `SendOption` are certainly more expensive
+than those of `Rc` and `Option`, which are non-existrent, they are still reasonably cheap.
 
 `SendRc::deref()` just compares the id of the pinned-to thread fetched with a relaxed
-atomic load with the current thread, and checks that migration isn't in progress with
-another integer comparison. The relaxed atomic load compiles to an ordinary load on Intel,
-which is as cheap as it gets, and if you're worried, you can hold on to the reference to
-avoid repeating the checks. (The borrow checker will prevent you from sending the `SendRc`
-to another thread while there is an outstanding reference.)  `SendRc::clone()` and
+atomic load with the current thread, and checks that migration isn't in progress with an
+integer comparison. The relaxed atomic load compiles to an ordinary load on Intel, which
+is as cheap as it gets, and if you're worried, you can hold on to the reference to avoid
+repeating the checks. (The borrow checker will prevent you from sending the `SendRc` to
+another thread while there is an outstanding reference.) `SendRc::clone()` and
 `SendRc::drop()` do the same kind of check.
 
 `SendOption::deref()` and `SendOption::deref_mut()` only check that the current thread is
 the pinned-to thread, the same as in `SendRc`.
 
 Regarding memory usage, `SendRc`'s heap overhead is two `u64`s for the pinning info, and a
-machine word for the reference count. An individual `SendRc` is two machine words wide
-because it has to carry an identity of the pointer. `SendOption` stores a `u64` alongside
-the underlying option.
+machine word for the reference count, i.e. on 64-bit architecture it's one `u64` more than
+`Rc`. An individual `SendRc` is two machine words wide because it has to carry an identity
+of the pointer. `SendOption` stores a `u64` alongside the underlying option.
 
 ## License
 
