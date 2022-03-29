@@ -10,7 +10,7 @@
 //! like `RefCell`.
 
 use std::borrow::Borrow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
@@ -50,7 +50,7 @@ static NEXT_PRE_SEND_ID: AtomicU64 = AtomicU64::new(1);
 /// let mut r2 = SendRc::clone(&r1);
 ///
 /// // prepare to ship them off to a different thread
-/// let mut pre_send = SendRc::pre_send();
+/// let pre_send = SendRc::pre_send();
 /// pre_send.mark_send(&mut r1); // r1 and r2 cannot be dereferenced from this point
 /// pre_send.mark_send(&mut r2);
 /// // ready() would panic if there were unmarked SendRcs pointing to the allocation
@@ -171,7 +171,7 @@ impl<T> SendRc<T> {
     /// # use sendable::SendRc;
     /// let mut r1 = SendRc::new(RefCell::new(1));
     /// let mut r2 = SendRc::clone(&r1);
-    /// let mut pre_send = SendRc::pre_send();
+    /// let pre_send = SendRc::pre_send();
     /// pre_send.mark_send(&mut r1);
     /// pre_send.mark_send(&mut r2);
     /// let mut post_send = pre_send.ready();
@@ -181,7 +181,7 @@ impl<T> SendRc<T> {
     /// ```
     pub fn pre_send() -> PreSend<T> {
         PreSend {
-            marked: HashMap::new(),
+            marked: Default::default(),
             pre_send_id: NEXT_PRE_SEND_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -199,7 +199,7 @@ impl<T> SendRc<T> {
     where
         T: 'a,
     {
-        let mut pre_send = Self::pre_send();
+        let pre_send = Self::pre_send();
         for send_rc in all {
             pre_send.mark_send(send_rc);
         }
@@ -257,7 +257,7 @@ impl<T> SendRc<T> {
 /// This handle is not `Send`; when done with calls to `mark_send()`, invoke `ready()` to
 /// obtain a token that can be moved to the other thread to re-enable the `SendRc`s.
 pub struct PreSend<T> {
-    marked: HashMap<usize, NonNull<Inner<T>>>,
+    marked: RefCell<HashMap<usize, NonNull<Inner<T>>>>,
     pre_send_id: u64,
 }
 
@@ -278,7 +278,7 @@ impl<T> PreSend<T> {
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last migrated to. Also panics when passed a `send_rc` that was already
     /// marked by a different `PreSend` handle.
-    pub fn mark_send<'a>(&'a mut self, send_rc: &'a mut SendRc<T>) -> &'a T {
+    pub fn mark_send<'a>(&'a self, send_rc: &'a mut SendRc<T>) -> &'a T {
         match send_rc.check_pinned() {
             PinCheck::Ok => {
                 send_rc.inner().marking.set(self.pre_send_id);
@@ -293,7 +293,7 @@ impl<T> PreSend<T> {
                 }
             }
         }
-        self.marked.insert(send_rc.id, send_rc.ptr);
+        self.marked.borrow_mut().insert(send_rc.id, send_rc.ptr);
         &send_rc.inner().val
     }
 
@@ -305,7 +305,7 @@ impl<T> PreSend<T> {
     pub fn is_marked(&self, send_rc: &SendRc<T>) -> bool {
         match send_rc.check_pinned() {
             PinCheck::Ok => false,
-            PinCheck::Marking => self.marked.contains_key(&send_rc.id),
+            PinCheck::Marking => self.marked.borrow().contains_key(&send_rc.id),
             check @ PinCheck::BadThread => panic!("PreSend::is_marked(): {}", check.errmsg()),
         }
     }
@@ -337,7 +337,7 @@ impl<T> PreSend<T> {
     /// let mut r2 = SendRc::clone(&r1);
     /// let mut q1 = SendRc::new(RefCell::new(1));
     /// let mut q2 = SendRc::clone(&q1);
-    /// let mut pre_send = SendRc::pre_send();
+    /// let pre_send = SendRc::pre_send();
     /// pre_send.mark_send(&mut r1);
     /// assert!(pre_send.all_marked() == false); // r2 still unmarked
     /// pre_send.mark_send(&mut r2);
@@ -351,10 +351,13 @@ impl<T> PreSend<T> {
     pub fn all_marked(&self) -> bool {
         // Count how many `SendRc`s point to each allocation.
         let ptr_sendrc_cnt: HashMap<_, usize> =
-            self.marked.values().fold(HashMap::new(), |mut map, &ptr| {
-                *map.entry(ptr).or_default() += 1;
-                map
-            });
+            self.marked
+                .borrow()
+                .values()
+                .fold(HashMap::new(), |mut map, &ptr| {
+                    *map.entry(ptr).or_default() += 1;
+                    map
+                });
         ptr_sendrc_cnt.into_iter().all(|(ptr, cnt)| {
             // Safety: allocation is valid because there is at least 1 SendRc pointing to
             // it. We may access it from this thread because PreSend isn't Send.
@@ -377,7 +380,7 @@ impl<T> PreSend<T> {
         if !self.all_marked() {
             panic!("PreSend::ready() called before all SendRcs have been marked");
         }
-        let ptrs: HashSet<_> = self.marked.into_values().collect();
+        let ptrs: HashSet<_> = self.marked.into_inner().into_values().collect();
         // Pin allocations to a non-existent thread id, so that enable() can detect the
         // new thread from which we are called (even if that new thread is the current
         // thread again).
@@ -618,7 +621,7 @@ mod tests {
     fn incomplete_pre_send() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let _r2 = SendRc::clone(&r1);
-        let mut pre_send = SendRc::pre_send();
+        let pre_send = SendRc::pre_send();
         pre_send.mark_send(&mut r1);
         let _ = pre_send.ready(); // panics because we didn't mark _r2
     }
@@ -630,7 +633,7 @@ mod tests {
         let mut r2 = SendRc::clone(&r1);
         let mut q1 = SendRc::new(RefCell::new(1));
         let _q2 = SendRc::clone(&q1);
-        let mut pre_send = SendRc::pre_send();
+        let pre_send = SendRc::pre_send();
         pre_send.mark_send(&mut r1);
         pre_send.mark_send(&mut r2);
         pre_send.mark_send(&mut q1);
@@ -642,7 +645,7 @@ mod tests {
     fn faked_pre_send_count_reusing_same_ptr() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let _r2 = SendRc::clone(&r1);
-        let mut pre_send = SendRc::pre_send();
+        let pre_send = SendRc::pre_send();
         // marking the same SendRc twice won't fool us into thinking all SendRcs were
         // marked
         pre_send.mark_send(&mut r1);
@@ -654,9 +657,9 @@ mod tests {
     #[should_panic = "call from different PreSend"]
     fn mark_same_sendrc_in_different_presend() {
         let mut r = SendRc::new(RefCell::new(1));
-        let mut pre_send1 = SendRc::pre_send();
+        let pre_send1 = SendRc::pre_send();
         pre_send1.mark_send(&mut r);
-        let mut pre_send2 = SendRc::pre_send();
+        let pre_send2 = SendRc::pre_send();
         pre_send2.mark_send(&mut r);
         std::mem::forget(r); // prevent panic on drop
     }
@@ -665,7 +668,7 @@ mod tests {
     fn mark_twice_good() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::new(RefCell::new(1));
-        let mut pre_send = SendRc::pre_send();
+        let pre_send = SendRc::pre_send();
         pre_send.mark_send(&mut r1);
         pre_send.mark_send(&mut r1);
         pre_send.mark_send(&mut r2);
@@ -682,8 +685,8 @@ mod tests {
             move || {
                 let mut r1 = SendRc::new(RefCell::new(1));
                 let mut r2 = SendRc::new(RefCell::new(1));
-                let mut pre_send1 = SendRc::pre_send();
-                let mut pre_send2 = SendRc::pre_send();
+                let pre_send1 = SendRc::pre_send();
+                let pre_send2 = SendRc::pre_send();
                 *state.lock().unwrap() = 1;
                 pre_send1.mark_send(&mut r1);
                 *state.lock().unwrap() = 2;
