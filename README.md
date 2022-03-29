@@ -34,8 +34,8 @@ and unsynchronized manipulation of the reference counts would be undefined behav
 wreak havoc.
 
 If there were a way to demonstrate to Rust that you've sent all pointers to a particular
-allocation to a different thread, there would be no problem in moving `Rc<T>` instances to
-a different thread, provided that `T` itself were `Send`. `SendRc` does exactly that.
+shared value to a different thread, there would be no problem in moving `Rc<T>` instances
+to a different thread, provided that `T` itself were `Send`. `SendRc` does exactly that.
 
 ## How does SendRc work?
 
@@ -45,10 +45,10 @@ through `clone()` and `drop()`, it checks that the `SendRc` is still in the thre
 created in.
 
 When `SendRc`s needs to be moved to a different thread, each pointer is explicitly marked
-for sending using the API provided for that purpose. Once thus marked, access to
-underlying data from that pointer is prohibited, even in the original thread. When all
-pointers to an allocation are marked, they can be sent across the thread boundary, and
-explicitly re-enabled in the new thread. In a simple case of two `SendRc`s, the process
+for sending using the API provided for that purpose. Once thus marked, access to the
+shared value from that pointer is prohibited, even in the original thread. When all
+`SendRc`s pointing to the shared value are marked, they can be sent across the thread
+boundary, and re-enabled in the new thread. In a simple case of two `SendRc`s, the process
 looks like this:
 
 ```rust
