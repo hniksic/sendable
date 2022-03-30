@@ -53,7 +53,10 @@ impl<T> SendOption<T> {
 
     /// Call this after moving the option to another thread.
     ///
-    /// This will panic if the option is not `None`.
+    /// After successful invocation the option will be pinned to the new thread, and you
+    /// can use it normally.
+    ///
+    /// Panics if the option is not `None`.
     pub fn post_send(&mut self) {
         if self.inner.is_some() {
             panic!("attempt to send non-None SendOption to a different thread");

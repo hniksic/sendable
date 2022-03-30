@@ -6,14 +6,14 @@
 //! * [`SendOption<T>`], a container like `Option` that is `Send` even if `T` is not `Send`.
 //!
 //! Both types rely on run-time checks to enforce Rust's safety guarantees. `SendRc`
-//! requires the pointers to be disabled before being sent to a different thread, and
-//! re-enabled after. `SendOption` requires the option to be set to `None` before being
-//! sent to another thread, and then to be explicitly migrated before use.
+//! requires the pointers to be disabled before being sent to a different thread.
+//! `SendOption` requires the option to be set to `None` before being sent to another
+//! thread.
 //!
-//! `SendRc` is designed for constructing single-threaded hierarchies that support data
-//! sharing and interior mutability (`Cell` and `RefCell`), and which needs to be
-//! transferred _en masse_ to a new thread. `Rc` doesn't allow that because it is not
-//! `Send`, and `Arc` doesn't allow that because it requires `T: Sync`.
+//! `SendRc` is designed for acyclic graphs and hierarchies with cross-references that are
+//! single-threaded and use interior mutability (`Cell` and `RefCell`), and which need to
+//! be occasionally transferred _en masse_ to a different thread. `Rc` doesn't allow that
+//! because it is not `Send`, and `Arc` doesn't allow that because it requires `T: Sync`.
 //!
 //! `SendOption` is designed for optional non-`Send` fields in otherwise `Send` types.
 //!

@@ -129,6 +129,10 @@ impl PinError {
             PinError::Parking => "access to SendRc that is about to be sent to a new thread",
         }
     }
+
+    fn panic(&self, what: &str) -> ! {
+        panic!("{what}: {}", self.msg());
+    }
 }
 
 impl<T> SendRc<T> {
@@ -181,10 +185,10 @@ impl<T> SendRc<T> {
     #[inline]
     fn assert_pinned(&self, op: &str) {
         self.check_pinned()
-            .unwrap_or_else(|pinerr| panic!("{op}: {}", pinerr.msg()));
+            .unwrap_or_else(|pinerr| pinerr.panic(op));
     }
 
-    /// Prepare to send `SendRc`s to a different thread.
+    /// Prepare to send `SendRc`s to another thread.
     ///
     /// To move a `SendRc` to a different thread, you must call [`park()`](PreSend::park)
     /// on that pointer, as well as on all other `SendRc`s pointing to the same shared
@@ -216,8 +220,8 @@ impl<T> SendRc<T> {
     /// post-send token returned by `pre_send.ready()`. Useful for one-shot move of
     /// `SendRc`s which are easily traversable.
     ///
-    /// Panics if there are `SendRc`s not included in `all` that point to some values
-    /// pointed to by `SendRc`s that are in `all`.
+    /// Panics if there exists a `SendRc`s not included in `all` that points to the same
+    /// value as a `SendRc` in `all`.
     pub fn pre_send_ready<'a>(all: impl IntoIterator<Item = &'a mut Self>) -> PostSend<T>
     where
         T: 'a,
@@ -229,7 +233,7 @@ impl<T> SendRc<T> {
         pre_send.ready()
     }
 
-    /// Returns the number of `SendRc`s pointing to this shared value.
+    /// Returns the number of `SendRc`s pointing to the value.
     ///
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last pinned to.
@@ -238,7 +242,7 @@ impl<T> SendRc<T> {
         this.inner().strong_count.get()
     }
 
-    /// Returns the inner value, if the `SendRc` has exactly one reference.
+    /// Returns the value if the `SendRc` has exactly one reference.
     ///
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last pinned to.
@@ -254,8 +258,8 @@ impl<T> SendRc<T> {
         }
     }
 
-    /// Returns a mutable reference into the given `SendRc`, if no other `SendRc`s point
-    /// to the same shared value.
+    /// Returns a mutable reference into the value pointed to by `this`, if no other
+    /// `SendRc`s point to the same value.
     ///
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last pinned to.
@@ -269,7 +273,7 @@ impl<T> SendRc<T> {
         }
     }
 
-    /// Returns true if this and the other `SendRc`s point to the same shared value.
+    /// Returns true if `this` and `other` point to the same shared value.
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
         this.ptr == other.ptr
     }
@@ -288,31 +292,31 @@ pub struct PreSend<T> {
 impl<T> PreSend<T> {
     /// Park the value pointed to by `send_rc`.
     ///
-    /// This method parks the value pointed to by this `SendRc`, which makes it
-    /// inaccessible through this or any other `SendRc` that points to it. Attempts to
-    /// deref, clone, or drop either this `SendRc` or any other that points to the same
-    /// shared value will result in panic. In addition to that, it registers this `SendRc`
-    /// as having participated in the parking.
+    /// Parking a value makes it inaccessible through this or any other `SendRc` that
+    /// points to it. Attempts to dereference, clone, or drop either this `SendRc` or any
+    /// other that points to the same shared value will result in panic. In addition to
+    /// that, `park()` registers this `SendRc` as having participated in the parking.
     ///
-    /// To send a `SendRc` to a different thread, one must park the value by invoking
+    /// To send a `SendRc` to a different thread, its value must be parked by invoking
     /// `park()` on all the `SendRc`s that point to the value.
     ///
-    /// It is allowed to park `SendRc`s pointing to different values of the same type.
-    /// Parking the same `SendRc` more than once is a no-op.
+    /// It is allowed to park `SendRc`s pointing to different values of the same type in
+    /// the same `PreSend`. Parking a `SendRc` that was already parked in the same
+    /// `PreSend` is a no-op.
     ///
     /// Returns a reference to the underlying value, which may be used to visit additional
-    /// `SendRc<T>`s that are only reachable through the value.
+    /// `SendRc`s that are only reachable through the value.
     ///
-    /// Panics when invoked from a thread different than the one the `SendRc` was created
-    /// in or last pinned to. Also panics when passed a `send_rc` that was already
-    /// parked by a different `PreSend`.
+    /// Panics when invoked from a thread different than the one `send_rc` was created in
+    /// or last pinned to. Also panics when passed a `send_rc` that was already parked by
+    /// a different `PreSend`.
     pub fn park<'a>(&'a self, send_rc: &'a mut SendRc<T>) -> &'a T {
         match send_rc.check_pinned() {
             Ok(()) => send_rc.inner().parking.set(self.pre_send_id),
-            Err(err @ PinError::BadThread) => panic!("PreSend::park(): {}", err.msg()),
+            Err(pinerr @ PinError::BadThread) => pinerr.panic("PreSend::park()"),
             Err(PinError::Parking) => {
-                // Allowing park() from a different PreSend would be unsound, see the
-                // same_sendrc_different_presend test.
+                // Allowing park() from a different PreSend would be unsound, see
+                // same_sendrc_different_presend.
                 if send_rc.inner().parking.get() != self.pre_send_id {
                     panic!("PreSend::park(): call from different PreSend");
                 }
@@ -322,16 +326,16 @@ impl<T> PreSend<T> {
         &send_rc.inner().val
     }
 
-    /// Asserts that there remain no unparked `SendRc`s pointing to the shared values
-    /// whose `SendRc`s were parked by this `PreSend`, and returns a [`PostSend`] that can
-    /// pin them to another thread.
+    /// Checks that there remain no unparked `SendRc`s pointing to values whose `SendRc`s
+    /// were parked by this `PreSend`, and returns a [`PostSend`] that can pin them to
+    /// another thread.
     ///
     /// At the point of invocation of `ready()`, Rust can statically verify that there are
     /// no outstanding references to the data pointed to by `SendRc`s parked by this
     /// `SendRc`.
     ///
-    /// Panics if the above assertion is untrue, i.e. if
-    /// [`is_ready()`](PreSend::is_ready) would return false.
+    /// Panics if the above check fails, i.e. if [`is_ready()`](PreSend::is_ready) would
+    /// return false.
     pub fn ready(self) -> PostSend<T> {
         if !self.is_ready() {
             panic!("PreSend::ready() called before all SendRcs have been parked");
@@ -348,8 +352,8 @@ impl<T> PreSend<T> {
         PostSend { ptrs }
     }
 
-    /// Returns true if there remain no unparked `SendRc`s pointing to the shared values
-    /// whose `SendRc`s were parked by this `PreSend`.
+    /// Returns true if there remain no unparked `SendRc`s pointing to values whose
+    /// `SendRc`s were parked by this `PreSend`.
     ///
     /// If this returns true, it means [`ready()`](PreSend::ready) will complete.
     ///
@@ -363,13 +367,13 @@ impl<T> PreSend<T> {
     /// let mut q2 = SendRc::clone(&q1);
     /// let pre_send = SendRc::pre_send();
     /// pre_send.park(&mut r1);
-    /// assert!(pre_send.is_ready() == false); // r2 still unparked
+    /// assert!(!pre_send.is_ready()); // r2 still unparked
     /// pre_send.park(&mut r2);
-    /// assert!(pre_send.is_ready() == true); // r1/r2 shared value fully parked, q1/q2 not involved
+    /// assert!(pre_send.is_ready());  // r1/r2 shared value fully parked, q1/q2 not involved
     /// pre_send.park(&mut q1);
-    /// assert!(pre_send.is_ready() == false); // r1/r2 ok, but q2 unparked
+    /// assert!(!pre_send.is_ready()); // r1/r2 ok, but q2 unparked
     /// pre_send.park(&mut q2);
-    /// assert!(pre_send.is_ready() == true); // both r1/r2 and q1/q2 shared values fully parked
+    /// assert!(pre_send.is_ready());  // both r1/r2 and q1/q2 shared values fully parked
     /// # std::mem::forget([r1, r2, q1, q2]);
     /// ```
     pub fn is_ready(&self) -> bool {
@@ -383,8 +387,8 @@ impl<T> PreSend<T> {
                     map
                 });
         ptr_sendrc_cnt.into_iter().all(|(ptr, cnt)| {
-            // Safety: shared value is valid because there is at least 1 SendRc pointing
-            // to it. We may access it from this thread because PreSend isn't Send.
+            // Safety: ptr is valid because there is at least 1 SendRc containing it. We
+            // may access it from this thread because PreSend isn't Send.
             let inner = unsafe { &*ptr.as_ptr() };
             cnt == inner.strong_count.get()
         })
@@ -423,7 +427,7 @@ impl<T> PreSend<T> {
                 value_parked = true;
                 sendrc_parked = self.parked.borrow().contains_key(&send_rc.id);
             }
-            Err(err @ PinError::BadThread) => panic!("PreSend::is_sendrc_parked(): {}", err.msg()),
+            Err(pinerr @ PinError::BadThread) => pinerr.panic("PreSend::park_status()"),
         }
         ParkStatus {
             sendrc_parked,
@@ -521,9 +525,9 @@ impl<T> Drop for SendRc<T> {
                     self.inner().strong_count.set(refcnt - 1);
                 }
             }
-            Err(err) => {
+            Err(pinerr) => {
                 if !std::thread::panicking() {
-                    panic!("SendRc::drop(): {}", err.msg());
+                    pinerr.panic("SendRc::drop()");
                 }
             }
         }
