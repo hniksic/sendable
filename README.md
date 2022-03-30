@@ -60,7 +60,7 @@ let pre_send = SendRc::pre_send();
 pre_send.park(&mut r1); // r1 and r2 cannot be dereferenced from this point
 pre_send.park(&mut r2);
 // ready() would panic if there were unparked SendRcs pointing to the shared value
-let mut post_send = pre_send.ready();
+let post_send = pre_send.ready();
 
 // move everything to a different thread
 std::thread::spawn(move || {

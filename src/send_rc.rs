@@ -9,6 +9,17 @@
 //! from a single thread. This property makes it safely `Send` even when holding
 //! non-`Sync` types like `RefCell`.
 
+use std::borrow::Borrow;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::fmt::{Debug, Display};
+use std::hash::{Hash, Hasher};
+use std::ops::Deref;
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use crate::thread_id::current_thread;
+
 // Safety:
 //
 // We require `T: Send` to make SendRc<T> Send, so there is no impediment to moving T from
@@ -39,17 +50,7 @@
 //   the PreSend (so no T& returned by calls to park() exist). The token returned by
 //   ready() is Send, and has a single method that pins the values that participated in
 //   parking to the new thread.
-
-use std::borrow::Borrow;
-use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
-use std::fmt::{Debug, Display};
-use std::hash::{Hash, Hasher};
-use std::ops::Deref;
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-
-use crate::thread_id::current_thread;
+unsafe impl<T> Send for SendRc<T> where T: Send {}
 
 struct Inner<T> {
     // id of thread from which the value can be accessed
@@ -64,16 +65,16 @@ static NEXT_PRE_SEND_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Reference-counting pointer like `Rc<T>`, but which is `Send` if `T` is `Send`.
 ///
-/// After a `SendRc` is created, it is pinned to the current thread, and usable only in
-/// that thread. Before sending a `SendRc` to different thread, you must call
+/// When created, a `SendRc` is pinned to the current thread, and is usable only in that
+/// thread. Before sending a `SendRc` to different thread, you must call
 /// [`SendRc::pre_send()`] and use the returned `PreSend` to park all the `SendRc`s that
 /// point to the same shared value with a call to [`pre_send.park()`](PreSend::park) on
 /// each. This will make the values temporarily inaccessible.
 ///
 /// When done with parking, you can obtain the `post_send` token with
-/// [`pre_send.ready()`](PreSend::ready), and restore access to values by calling
-/// [`post_send.unpark()`](PostSend::unpark). This process may be repeated to send the
-/// `SendRc`s to another thread later.
+/// [`pre_send.ready()`](PreSend::ready), and restore access to values in another thread
+/// by calling [`post_send.unpark()`](PostSend::unpark) there. This process may be
+/// repeated to send the `SendRc`s to another thread later.
 ///
 /// ```
 /// # use std::cell::RefCell;
@@ -87,7 +88,7 @@ static NEXT_PRE_SEND_ID: AtomicU64 = AtomicU64::new(1);
 /// pre_send.park(&mut r1); // r1 and r2 cannot be dereferenced from this point
 /// pre_send.park(&mut r2);
 /// // ready() would panic if there were unparked SendRcs pointing to the shared value
-/// let mut post_send = pre_send.ready();
+/// let post_send = pre_send.ready();
 ///
 /// // move everything to a different thread
 /// std::thread::spawn(move || {
@@ -116,24 +117,16 @@ pub struct SendRc<T> {
     id: usize,
 }
 
-// Safety: SendRc can be sent between threads because we prohibit access to clone, drop,
-// and deref except from the thread they are pinned to. Access is granted only after all
-// pointers to the same shared value have been pinned to the new thread, which is why we
-// can avoid requiring T: Sync.
-unsafe impl<T> Send for SendRc<T> where T: Send {}
-
-enum PinCheck {
-    Ok,
+enum PinError {
     BadThread,
     Parking,
 }
 
-impl PinCheck {
-    fn errmsg(&self) -> &'static str {
+impl PinError {
+    fn msg(&self) -> &'static str {
         match self {
-            PinCheck::Ok => "no error",
-            PinCheck::BadThread => "SendRc accessed from wrong thread; call pre_send() first",
-            PinCheck::Parking => "access to SendRc that is about to be sent to a new thread",
+            PinError::BadThread => "SendRc accessed from wrong thread; call pre_send() first",
+            PinError::Parking => "access to SendRc that is about to be sent to a new thread",
         }
     }
 }
@@ -174,31 +167,28 @@ impl<T> SendRc<T> {
     }
 
     #[inline]
-    fn check_pinned(&self) -> PinCheck {
+    fn check_pinned(&self) -> Result<(), PinError> {
         let inner = self.inner();
         if inner.pinned_to.load(Ordering::Relaxed) != current_thread() {
-            return PinCheck::BadThread;
+            return Err(PinError::BadThread);
         }
         if inner.parking.get() != 0 {
-            return PinCheck::Parking;
+            return Err(PinError::Parking);
         }
-        PinCheck::Ok
+        Ok(())
     }
 
+    #[inline]
     fn assert_pinned(&self, op: &str) {
-        match self.check_pinned() {
-            PinCheck::Ok => {}
-            check @ (PinCheck::BadThread | PinCheck::Parking) => {
-                panic!("{op}: {}", check.errmsg());
-            }
-        }
+        self.check_pinned()
+            .unwrap_or_else(|pinerr| panic!("{op}: {}", pinerr.msg()));
     }
 
-    /// Prepare to send `SendRc`s of this type to a different thread.
+    /// Prepare to send `SendRc`s to a different thread.
     ///
-    /// Before moving a `SendRc` to a different thread, you must call
-    /// [`park()`](PreSend::park) on that pointer, as well as on all other
-    /// `SendRc`s pointing to the same shared value.
+    /// To move a `SendRc` to a different thread, you must call [`park()`](PreSend::park)
+    /// on that pointer, as well as on all other `SendRc`s pointing to the same shared
+    /// value.
     ///
     /// ```
     /// # use std::cell::RefCell;
@@ -208,7 +198,7 @@ impl<T> SendRc<T> {
     /// let pre_send = SendRc::pre_send();
     /// pre_send.park(&mut r1);
     /// pre_send.park(&mut r2);
-    /// let mut post_send = pre_send.ready();
+    /// let post_send = pre_send.ready();
     /// // post_send, r1, and r2 can now be send to a different thread, and re-enabled
     /// // by calling post_send.unpark()
     /// # post_send.unpark(); // avoid panic in doctest
@@ -220,15 +210,14 @@ impl<T> SendRc<T> {
         }
     }
 
-    /// Prepare to send a fixed collection of `SendRc`s to a different thread.
+    /// Prepare to send a collection of `SendRc`s to a different thread.
     ///
-    /// Calls `SendRc::pre_send()`, followed by `park()` on the provided `SendRc`s,
-    /// and finally returns the post-send token returned by the call to
-    /// `pre_send.ready()`. Useful for one-shot move of `SendRc`s which are easily
-    /// traversable.
+    /// Calls `SendRc::pre_send()`, parks the provided `SendRc`s, and finally returns the
+    /// post-send token returned by `pre_send.ready()`. Useful for one-shot move of
+    /// `SendRc`s which are easily traversable.
     ///
-    /// Panics if there are shared values pointed to by `SendRc`s in `all` which have
-    /// extra `SendRc`s not included in `all`.
+    /// Panics if there are `SendRc`s not included in `all` that point to some values
+    /// pointed to by `SendRc`s that are in `all`.
     pub fn pre_send_ready<'a>(all: impl IntoIterator<Item = &'a mut Self>) -> PostSend<T>
     where
         T: 'a,
@@ -265,8 +254,8 @@ impl<T> SendRc<T> {
         }
     }
 
-    /// Returns a mutable reference into the given `SendRc`, if there no other `SendRc`s
-    /// point to the same shared value.
+    /// Returns a mutable reference into the given `SendRc`, if no other `SendRc`s point
+    /// to the same shared value.
     ///
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last pinned to.
@@ -308,8 +297,8 @@ impl<T> PreSend<T> {
     /// To send a `SendRc` to a different thread, one must park the value by invoking
     /// `park()` on all the `SendRc`s that point to the value.
     ///
-    /// It is allowed to call this method with `SendRc`s pointing to different values of
-    /// the same type. Parking the same `SendRc` more than once is a no-op.
+    /// It is allowed to park `SendRc`s pointing to different values of the same type.
+    /// Parking the same `SendRc` more than once is a no-op.
     ///
     /// Returns a reference to the underlying value, which may be used to visit additional
     /// `SendRc<T>`s that are only reachable through the value.
@@ -319,11 +308,9 @@ impl<T> PreSend<T> {
     /// parked by a different `PreSend`.
     pub fn park<'a>(&'a self, send_rc: &'a mut SendRc<T>) -> &'a T {
         match send_rc.check_pinned() {
-            PinCheck::Ok => {
-                send_rc.inner().parking.set(self.pre_send_id);
-            }
-            check @ PinCheck::BadThread => panic!("PreSend::park(): {}", check.errmsg()),
-            PinCheck::Parking => {
+            Ok(()) => send_rc.inner().parking.set(self.pre_send_id),
+            Err(err @ PinError::BadThread) => panic!("PreSend::park(): {}", err.msg()),
+            Err(PinError::Parking) => {
                 // Allowing park() from a different PreSend would be unsound, see the
                 // same_sendrc_different_presend test.
                 if send_rc.inner().parking.get() != self.pre_send_id {
@@ -431,14 +418,12 @@ impl<T> PreSend<T> {
     pub fn park_status(&self, send_rc: &SendRc<T>) -> ParkStatus {
         let (mut sendrc_parked, mut value_parked) = (false, false);
         match send_rc.check_pinned() {
-            PinCheck::Ok => {}
-            PinCheck::Parking => {
+            Ok(()) => {}
+            Err(PinError::Parking) => {
                 value_parked = true;
                 sendrc_parked = self.parked.borrow().contains_key(&send_rc.id);
             }
-            check @ PinCheck::BadThread => {
-                panic!("PreSend::is_sendrc_parked(): {}", check.errmsg())
-            }
+            Err(err @ PinError::BadThread) => panic!("PreSend::is_sendrc_parked(): {}", err.msg()),
         }
         ParkStatus {
             sendrc_parked,
@@ -526,7 +511,7 @@ impl<T> Drop for SendRc<T> {
         // leak the value if we're not. Then panic, but only if we're not already
         // panicking, because panic-inside-panic aborts the program and breaks unit tests.
         match self.check_pinned() {
-            PinCheck::Ok => {
+            Ok(()) => {
                 let refcnt = self.inner().strong_count.get();
                 if refcnt == 1 {
                     unsafe {
@@ -536,9 +521,9 @@ impl<T> Drop for SendRc<T> {
                     self.inner().strong_count.set(refcnt - 1);
                 }
             }
-            check @ (PinCheck::BadThread | PinCheck::Parking) => {
+            Err(err) => {
                 if !std::thread::panicking() {
-                    panic!("SendRc::drop(): {}", check.errmsg());
+                    panic!("SendRc::drop(): {}", err.msg());
                 }
             }
         }
