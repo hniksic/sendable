@@ -166,7 +166,7 @@ impl<T> SendRc<T> {
     }
 
     fn inner(&self) -> &Inner<T> {
-        // Safety: Shared Value is valid at least as long as self
+        // Safety: Shared value is valid at least as long as self
         unsafe { self.ptr.as_ref() }
     }
 
@@ -325,9 +325,8 @@ impl<T> PreSend<T> {
             }
             check @ PinCheck::BadThread => panic!("PreSend::mark_send(): {}", check.errmsg()),
             PinCheck::Marking => {
-                // Don't allow mark_send() from a rogue PreSend because we return a
-                // reference tied to the lifetime of self, and depend on self being
-                // consumed before it's sent to the new thread.
+                // Allowing mark_send() from a different PreSend would be unsound, see the
+                // same_sendrc_different_presend test.
                 if send_rc.inner().marking.get() != self.pre_send_id {
                     panic!("PreSend::mark_send(): call from different PreSend");
                 }
@@ -335,6 +334,32 @@ impl<T> PreSend<T> {
         }
         self.marked.borrow_mut().insert(send_rc.id, send_rc.ptr);
         &send_rc.inner().val
+    }
+
+    /// Assert that there remain no unmarked `SendRc`s pointing to the shared values whose
+    /// `SendRc`s were marked by this `PreSend`, and return a [`PostSend`] used to migrate
+    /// them to another thread.
+    ///
+    /// At the point of invocation of `ready()`, Rust can statically verify that there are
+    /// no outstanding references to the data pointed to by `SendRc`s involved in the
+    /// migration.
+    ///
+    /// Panics if the above assertion is untrue, i.e. if
+    /// [`all_marked()`](PreSend::all_marked) would return false.
+    pub fn ready(self) -> PostSend<T> {
+        if !self.all_marked() {
+            panic!("PreSend::ready() called before all SendRcs have been marked");
+        }
+        let ptrs: HashSet<_> = self.marked.into_inner().into_values().collect();
+        // Pin shared values to a non-existent thread id, so that enable() can detect the
+        // new thread from which we are called (even if that new thread is the current
+        // thread again).
+        for &ptr in &ptrs {
+            // Safety: ptr belongs to at least one SendRc, so it's valid
+            let inner = unsafe { &*ptr.as_ptr() };
+            inner.pinned_to.store(0, Ordering::Relaxed);
+        }
+        PostSend { ptrs }
     }
 
     /// Returns true if `send_rc` was already marked for sending by this `PreSend` handle.
@@ -387,8 +412,8 @@ impl<T> PreSend<T> {
         }
     }
 
-    /// Returns true if there are no unmarked `SendRc`s pointing to the shared values
-    /// whose `SendRc`s we've marked.
+    /// Returns true if there remain no unmarked `SendRc`s pointing to the shared values
+    /// whose `SendRc`s were marked by this `PreSend`.
     ///
     /// If this returns true, it means [`ready()`](PreSend::ready) will succeed without
     /// panic.
@@ -429,35 +454,6 @@ impl<T> PreSend<T> {
             cnt == inner.strong_count.get()
         })
     }
-
-    /// Assert that there are no unmarked `SendRc`s pointing to the shared values whose
-    /// `SendRc`s we've marked and return a [`PostSend`] token that proves that this was
-    /// checked.
-    ///
-    /// The returned token can be sent to another thread along with the `SendRc`s, and
-    /// used to re-enable them with a call to [`sent()`](PostSend::sent).
-    ///
-    /// At the point of invocation of `ready()`, Rust can statically verify that there are
-    /// no outstanding references to the data pointed to by `SendRc`s involved in the
-    /// migration.
-    ///
-    /// Panics if the above assertion is untrue, i.e. if
-    /// [`all_marked()`](PreSend::all_marked) would return false.
-    pub fn ready(self) -> PostSend<T> {
-        if !self.all_marked() {
-            panic!("PreSend::ready() called before all SendRcs have been marked");
-        }
-        let ptrs: HashSet<_> = self.marked.into_inner().into_values().collect();
-        // Pin shared values to a non-existent thread id, so that enable() can detect the
-        // new thread from which we are called (even if that new thread is the current
-        // thread again).
-        for &ptr in &ptrs {
-            // Safety: ptr belongs to at least one SendRc, so it's valid
-            let inner = unsafe { &*ptr.as_ptr() };
-            inner.pinned_to.store(0, Ordering::Relaxed);
-        }
-        PostSend { ptrs }
-    }
 }
 
 /// Token for migrating the `SendRc`s marked with `PreSend` to another thread.
@@ -477,10 +473,10 @@ pub struct PostSend<T> {
 unsafe impl<T> Send for PostSend<T> where T: Send {}
 
 impl<T> PostSend<T> {
-    /// Migrate the values pointed to by all `SendRc`s passed to `PreSend` to the current thread.
+    /// Migrate the `SendRc`s previously passed to `PreSend` into the current thread.
     ///
     /// This re-enables all the pointers involved in the migration and makes their data
-    /// accessible from this thread.
+    /// accessible from this (and only this) thread.
     pub fn sent(self) {
         let current_thread = current_thread();
         for ptr in self.ptrs {
@@ -724,13 +720,22 @@ mod tests {
 
     #[test]
     #[should_panic = "call from different PreSend"]
-    fn mark_same_sendrc_in_different_presend() {
-        let mut r = SendRc::new(RefCell::new(1));
+    fn same_sendrc_different_presend() {
+        let mut r1 = SendRc::new(RefCell::new(1));
+        let mut r2 = SendRc::clone(&r1);
         let pre_send1 = SendRc::pre_send();
-        pre_send1.mark_send(&mut r);
+        pre_send1.mark_send(&mut r1);
+        pre_send1.mark_send(&mut r2);
         let pre_send2 = SendRc::pre_send();
-        pre_send2.mark_send(&mut r);
-        std::mem::forget(r); // prevent panic on drop
+        let ref1 = pre_send2.mark_send(&mut r1); // this must panic
+        let post_send = pre_send1.ready();
+        // if the above didn't panic, this would execute and be UB
+        std::thread::spawn(move || {
+            post_send.sent();
+            let ref2 = &*r2;
+            *ref2.borrow_mut() += 1; // data race with ref1
+        });
+        *ref1.borrow_mut() += 1; // data race with ref2
     }
 
     #[test]
