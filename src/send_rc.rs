@@ -381,7 +381,9 @@ impl<T> PreSend<T> {
         match send_rc.check_pinned() {
             PinCheck::Ok => false,
             PinCheck::Marking => true,
-            check @ PinCheck::BadThread => panic!("PreSend::is_marked(): {}", check.errmsg()),
+            check @ PinCheck::BadThread => {
+                panic!("PreSend::is_shared_value_marked(): {}", check.errmsg())
+            }
         }
     }
 
