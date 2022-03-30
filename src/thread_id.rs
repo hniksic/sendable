@@ -25,12 +25,16 @@ mod tests {
             let id = current_thread();
             assert_eq!(id, current_thread());
             id
-        }).join().unwrap();
+        })
+        .join()
+        .unwrap();
         let t3 = std::thread::spawn(|| {
             let id = current_thread();
             assert_eq!(id, current_thread());
             id
-        }).join().unwrap();
+        })
+        .join()
+        .unwrap();
         assert!(t1 != t2);
         assert!(t2 != t3);
         assert!(t1 != t3);

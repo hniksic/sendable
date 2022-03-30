@@ -1,6 +1,5 @@
 ///! Optional support for the deepsize crate.
-
-use crate::{SendRc, SendOption};
+use crate::{SendOption, SendRc};
 
 impl<T> deepsize::DeepSizeOf for SendRc<T>
 where

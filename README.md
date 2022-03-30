@@ -44,30 +44,29 @@ reference count. On access to the value, and before manipulating the reference c
 through `clone()` and `drop()`, it checks that the `SendRc` is still in the thread it was
 created in.
 
-When `SendRc`s needs to be moved to a different thread, each pointer is explicitly marked
-for sending using the API provided for that purpose. Once thus marked, access to the
-shared value from that pointer is prohibited, even in the original thread. When all
-`SendRc`s pointing to the shared value are marked, they can be sent across the thread
-boundary, and re-enabled in the new thread. In a simple case of two `SendRc`s, the process
-looks like this:
+Before `SendRc`s are moved to a different thread, each pointer is explicitly "parked",
+i.e. registered for sending. Once parked, access to the value it points to is prohibited,
+even in the original thread. When all `SendRc`s pointing to the shared value are parked,
+they can be sent across the thread boundary, and re-enabled in the new thread. In a simple
+case of two `SendRc`s, the process looks like this:
 
 ```rust
-// create two SendRcs pointing to the same allocation
+// create two SendRcs pointing to the same shared value
 let mut r1 = SendRc::new(RefCell::new(1));
 let mut r2 = SendRc::clone(&r1);
 
 // prepare to ship them off to a different thread
-let mut pre_send = SendRc::pre_send();
-pre_send.mark_send(&mut r1); // allocation is unusable from this point
-pre_send.mark_send(&mut r2);
-// ready() would panic if there were unmarked SendRcs pointing to the allocation
+let pre_send = SendRc::pre_send();
+pre_send.park(&mut r1); // r1 and r2 cannot be dereferenced from this point
+pre_send.park(&mut r2);
+// ready() would panic if there were unparked SendRcs pointing to the shared value
 let mut post_send = pre_send.ready();
 
 // move everything to a different thread
 std::thread::spawn(move || {
     // both pointers are unusable here
-    post_send.sent();
-    // they are usable from this point
+    post_send.unpark();
+    // they're again usable from this point, but only in this thread
     *r1.borrow_mut() += 1;
     assert_eq!(*r2.borrow(), 2);
 })
