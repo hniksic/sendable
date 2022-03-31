@@ -1,4 +1,5 @@
-//! `Rc` and `Option` equivalents that facilitate sending data between threads.
+//! `Rc` and `Option` lookalikes that facilitate sending interconnected data between
+//! threads.
 //!
 //! This crate provides two types:
 //! * [`SendRc<T>`], a single-threaded reference-counted pointer like `Rc` that is `Send`

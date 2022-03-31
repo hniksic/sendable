@@ -65,37 +65,36 @@ static NEXT_PRE_SEND_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Reference-counting pointer like `Rc<T>`, but which is `Send` if `T` is `Send`.
 ///
-/// When created, a `SendRc` is pinned to the current thread, and is usable only in that
-/// thread. Before sending it to a different thread, you must use [`SendRc::pre_send()`]
-/// to _park_ all the `SendRc`s that point to the same shared value. This will make the
-/// values temporarily inaccessible from pointers, but will allow sending them safely.
-/// When done parking, you can obtain a `PostSend` and send it to the other thread to
-/// restore access to the values there. For example:
+/// When created, a `SendRc` is pinned to the current thread, and is usable only within
+/// it. Before sending it to a different thread, you must use [`SendRc::pre_send()`] to
+/// _park_ all the `SendRc`s that point to the same value. This will make the values
+/// temporarily inaccessible through `SendRc`s, but will allow safe transfer.  When done
+/// parking, you can obtain a `PostSend` and send it to the other thread to restore access
+/// to the values there. For example:
 ///
 /// ```
 /// # use std::cell::RefCell;
 /// # use sendable::SendRc;
-/// // create two SendRcs pointing to the same shared value
+/// // create two SendRcs pointing to a shared value
 /// let mut r1 = SendRc::new(RefCell::new(1));
 /// let mut r2 = SendRc::clone(&r1);
 ///
-/// // prepare to ship them off to a different thread
+/// // prepare to send them to a different thread
 /// let pre_send = SendRc::pre_send();
 /// pre_send.park(&mut r1); // r1 and r2 cannot be dereferenced from this point
 /// pre_send.park(&mut r2);
-/// // ready() would panic if there were unparked SendRcs pointing to the shared value
+/// // ready() would panic if there were unparked SendRcs pointing to the value
 /// let post_send = pre_send.ready();
 ///
 /// // move everything to a different thread
 /// std::thread::spawn(move || {
-///     // in this thread, SendRcs are unusable until unparked
+///     // SendRcs are still unusable until unparked
 ///     post_send.unpark();
-///     // they're again usable from this point, but only in this thread
+///     // they're again usable from this point, and only in this thread
 ///     *r1.borrow_mut() += 1;
 ///     assert_eq!(*r2.borrow(), 2);
 /// })
-/// .join()
-/// .unwrap();
+/// # .join().unwrap();
 /// ```
 ///
 /// This process may be repeated to send the `SendRc`s to another thread later.
@@ -108,9 +107,9 @@ static NEXT_PRE_SEND_ID: AtomicU64 = AtomicU64::new(1);
 /// * it currently doesn't support weak pointers.
 pub struct SendRc<T> {
     ptr: NonNull<Inner<T>>,
-    // Associate an non-changing id with each pointer so that we can track how many have
-    // participated in migration. If malicious code forces wrap-around of the id, we're
-    // still sound because passing two SendRcs with the same id to `PreSend::park()`
+    // Assign each SendRc an unchanging id, used to track which ones have participated in
+    // migration. If malicious code forces wrap-around of the id on a 32-bit architecture,
+    // we're still sound because passing two SendRcs with the same id to `PreSend::park()`
     // will just cause `PreSend::ready()` to always fail and prevent migration.
     id: usize,
 }
@@ -188,8 +187,7 @@ impl<T> SendRc<T> {
     /// Prepare to send `SendRc`s to another thread.
     ///
     /// To move a `SendRc` to a different thread, you must call [`park()`](PreSend::park)
-    /// on that pointer, as well as on all other `SendRc`s pointing to the same shared
-    /// value.
+    /// on that pointer, as well as on all other `SendRc`s pointing to the same value.
     ///
     /// ```
     /// # use std::cell::RefCell;
@@ -236,8 +234,8 @@ impl<T> SendRc<T> {
         }
     }
 
-    /// Returns a mutable reference into the value pointed to by `this`, if no other
-    /// `SendRc`s point to the same value.
+    /// Returns a mutable reference to the value `this` points to, if no other `SendRc`s
+    /// point to the same value.
     ///
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last pinned to.
@@ -251,7 +249,9 @@ impl<T> SendRc<T> {
         }
     }
 
-    /// Returns true if `this` and `other` point to the same shared value.
+    /// Returns true if `this` and `other` point to the same value.
+    ///
+    /// This method can be called from any thread.
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
         this.ptr == other.ptr
     }
@@ -272,11 +272,11 @@ impl<T> PreSend<T> {
     ///
     /// Parking a value makes it inaccessible through this or any other `SendRc` that
     /// points to it. Attempts to dereference, clone, or drop either this `SendRc` or any
-    /// other that points to the same shared value will result in panic. In addition to
-    /// that, `park()` registers this `SendRc` as having participated in the parking.
+    /// other that points to the same value will trigger a panic. Additionally, `park()`
+    /// registers `send_rc` in particular as having participated in the parking.
     ///
-    /// To send a `SendRc` to a different thread, its value must be parked by invoking
-    /// `park()` on all the `SendRc`s that point to the value.
+    /// To send a `SendRc` to a different thread, `park()` must be invoked on all the
+    /// `SendRc`s that point to the value.
     ///
     /// It is allowed to park `SendRc`s pointing to different values of the same type in
     /// the same `PreSend`. Parking a `SendRc` that was already parked in the same
@@ -308,9 +308,9 @@ impl<T> PreSend<T> {
     /// were parked by this `PreSend`, and returns a [`PostSend`] that can pin them to
     /// another thread.
     ///
-    /// At the point of invocation of `ready()`, Rust can statically verify that there are
-    /// no outstanding references to the data pointed to by `SendRc`s parked by this
-    /// `SendRc`.
+    /// At the point of invocation of `ready()`, the compiler will statically verify that
+    /// there are no outstanding references to the data pointed to by `SendRc`s parked by
+    /// this `PostSend`.
     ///
     /// Panics if the above check fails, i.e. if [`is_ready()`](PreSend::is_ready) would
     /// return false.
@@ -333,7 +333,7 @@ impl<T> PreSend<T> {
     /// Returns true if there remain no unparked `SendRc`s pointing to values whose
     /// `SendRc`s were parked by this `PreSend`.
     ///
-    /// If this returns true, it means [`ready()`](PreSend::ready) will complete.
+    /// If this returns true, it means [`ready()`](PreSend::ready) will succeed.
     ///
     /// For example:
     /// ```
@@ -372,7 +372,7 @@ impl<T> PreSend<T> {
         })
     }
 
-    /// Describes the park status of this `send_rc` and the value it points to.
+    /// Describes the park status of `send_rc` and the value it points to.
     ///
     /// This is useful for:
     ///
@@ -388,16 +388,16 @@ impl<T> PreSend<T> {
     /// let mut r2 = SendRc::clone(&r1);
     /// let pre_send = SendRc::pre_send();
     /// pre_send.park(&mut r1);
-    /// assert!(pre_send.park_status(&r1).sendrc_parked); // r1 is parked
-    /// assert!(!pre_send.park_status(&r2).sendrc_parked); // r2 is not yet parked
-    /// assert!(pre_send.park_status(&r1).value_parked); // the underlying value is parked
-    /// assert!(pre_send.park_status(&r2).value_parked); // the underlying value is parked
+    /// assert!(pre_send.park_status_of(&r1).sendrc_parked);  // r1 is parked
+    /// assert!(!pre_send.park_status_of(&r2).sendrc_parked); // r2 is not yet parked
+    /// assert!(pre_send.park_status_of(&r1).value_parked);   // the underlying value is parked
+    /// assert!(pre_send.park_status_of(&r2).value_parked);   // the underlying value is parked
     /// # std::mem::forget([r1, r2]);
     /// ```
     ///
     /// Panics when invoked from a different thread than the one the `SendRc` was created
     /// in or last pinned to.
-    pub fn park_status(&self, send_rc: &SendRc<T>) -> ParkStatus {
+    pub fn park_status_of(&self, send_rc: &SendRc<T>) -> ParkStatus {
         let (mut sendrc_parked, mut value_parked) = (false, false);
         match send_rc.check_pinned() {
             Ok(()) => {}
@@ -405,7 +405,7 @@ impl<T> PreSend<T> {
                 value_parked = true;
                 sendrc_parked = self.parked.borrow().contains_key(&send_rc.id);
             }
-            Err(pinerr @ PinError::BadThread) => pinerr.panic("PreSend::park_status()"),
+            Err(pinerr @ PinError::BadThread) => pinerr.panic("PreSend::park_status_of()"),
         }
         ParkStatus {
             sendrc_parked,
@@ -414,12 +414,12 @@ impl<T> PreSend<T> {
     }
 }
 
-/// Value returned by [`PreSend::park_status()`].
+/// Value returned by [`PreSend::park_status_of()`].
 pub struct ParkStatus {
-    /// True if the `SendRc` passed to `park_status()` has been parked.
+    /// True if the `SendRc` passed to `park_status_of()` has been parked.
     pub sendrc_parked: bool,
-    /// True if the value pointed to by the `SendRc` passed to `park_status()` has been
-    /// parked.
+    /// True if at least one `SendRc` that points to the same value as `SendRc` passed to
+    /// `park_status_of()` has been parked.
     pub value_parked: bool,
 }
 
@@ -489,25 +489,24 @@ impl<T> Clone for SendRc<T> {
 
 impl<T> Drop for SendRc<T> {
     fn drop(&mut self) {
-        // Instead of panicking immediately, check whether we're in the correct thread and
-        // leak the value if we're not. Then panic, but only if we're not already
-        // panicking, because panic-inside-panic aborts the program and breaks unit tests.
-        match self.check_pinned() {
-            Ok(()) => {
-                let refcnt = self.inner().strong_count.get();
-                if refcnt == 1 {
-                    unsafe {
-                        std::ptr::drop_in_place(self.ptr.as_ptr());
-                    }
-                } else {
-                    self.inner().strong_count.set(refcnt - 1);
-                }
+        if let Err(pinerr) = self.check_pinned() {
+            // Instead of asserting that we're pinned, check it, and panic only if we're
+            // not already panicking.  Panic-inside-panic aborts the program, making it
+            // harder to debug and breaking unit tests.
+            if std::thread::panicking() {
+                return;
             }
-            Err(pinerr) => {
-                if !std::thread::panicking() {
-                    pinerr.panic("SendRc::drop()");
-                }
+            pinerr.panic("SendRc::drop()");
+        }
+        // the pin is ok - proceed with the drop
+        let refcnt = self.inner().strong_count.get();
+        if refcnt == 1 {
+            // safety: refcnt == 1, time to die
+            unsafe {
+                std::ptr::drop_in_place(self.ptr.as_ptr());
             }
+        } else {
+            self.inner().strong_count.set(refcnt - 1);
         }
     }
 }
@@ -629,30 +628,33 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic = "drop()"]
     fn missing_pre_send_drop() {
         let r = SendRc::new(RefCell::new(1));
         std::thread::spawn(move || {
             drop(r);
         })
         .join()
+        .map_err(|e| e.downcast::<String>().unwrap())
         .unwrap();
     }
 
     #[test]
+    #[should_panic = "deref()"]
     fn missing_pre_send_deref() {
         let r1 = SendRc::new(RefCell::new(1));
         let r2 = SendRc::clone(&r1);
-        let result = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             *r1.borrow_mut() = 2; // this should panic
             assert_eq!(*r2.borrow(), 2);
         })
-        .join();
-        assert!(result.is_err());
+        .join()
+        .map_err(|e| e.downcast::<String>().unwrap())
+        .unwrap();
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic = "ready() called before"]
     fn incomplete_pre_send() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let _r2 = SendRc::clone(&r1);
@@ -676,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic = "before all SendRcs have been parked"]
     fn faked_pre_send_count_reusing_same_ptr() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let _r2 = SendRc::clone(&r1);
@@ -697,15 +699,15 @@ mod tests {
         pre_send1.park(&mut r1);
         pre_send1.park(&mut r2);
         let pre_send2 = SendRc::pre_send();
-        let ref1 = pre_send2.park(&mut r1); // this must panic
+        let _ref1: &RefCell<u32> = pre_send2.park(&mut r1); // this must panic
         let post_send = pre_send1.ready();
-        // if the above didn't panic, this would execute and be UB
+        // if the above didn't panic, the code below would run and be UB
         std::thread::spawn(move || {
             post_send.unpark();
-            let ref2 = &*r2;
-            *ref2.borrow_mut() += 1; // data race with ref1
+            let _ref2: &RefCell<u32> = &*r2;
+            //*ref2.borrow_mut() += 1; // data race with ref1
         });
-        *ref1.borrow_mut() += 1; // data race with ref2
+        //*ref1.borrow_mut() += 1; // data race with ref2
     }
 
     #[test]
