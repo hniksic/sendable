@@ -10,21 +10,21 @@ The `sendable` crate defines types to facilitate sending data between threads:
 
 ## When is SendRc useful?
 
-You might consider `SendRc` if:
+You should consider `SendRc` if:
 
 * your values form an acyclic graph or a hierarchy with cross-references;
 * you build and use the hierarchy from a single thread;
 * you need to occasionally move the whole thing to another thread.
 
-Within the confines of a single thread, using `Rc` and `RefCell` to represent acyclic
-graphs and data sharing is ergonomic and safe. It is also efficient because
-single-threaded manipulation doesn't require atomics or locks, makes `deref()` trivial,
-and allows the compiler to inline `borrow()` and `borrow_mut()` and even optimize them
-away where they are not globally observable.
+Within the confines of a single thread, `Rc` and `RefCell` provide an ergonomic and safe
+representation of acyclic graphs. They are also efficient because single-threaded
+manipulation doesn't require atomics or locks, makes `deref()` trivial, and allows the
+compiler to inline `borrow()` and `borrow_mut()` and even optimize them away where they
+are not globally observable.
 
-In programs that process many such graphs it comes in very useful to be able to create
-them in one thread and ship them to another for processing (and possibly to a third one
-for destruction). Given that types like `RefCell` and `Cell` are `Send`, the idea is not
+In programs that process many such graphs it comes very useful to be able to create them
+in one thread and ship them off to another for processing (and possibly to a third one for
+teardown). Given that types like `RefCell` and `Cell` are `Send`, the idea is not
 unthinkable. The trouble is with `Rc`, which is neither `Send` nor `Sync`, and for good
 reason. Even though it would be perfectly safe to move an entire hierarchy of
 `Rc<RefCell<T>>`s from one thread to another, the borrow checker doesn't allow it because
@@ -34,8 +34,9 @@ and unsynchronized manipulation of the reference counts would be undefined behav
 wreak havoc.
 
 If there were a way to demonstrate to Rust that you've sent all pointers to a particular
-shared value to a different thread, there would be no problem in moving `Rc<T>` instances
-to a different thread, provided that `T` itself were `Send`. `SendRc` does exactly that.
+shared value to a different thread, there would be no problem in sending `Rc<T>` across
+thread boundary, as long as `T` itself is `Send`. That demonstration is exactly what
+`SendRc` brings to the table.
 
 ## How does SendRc work?
 
@@ -159,7 +160,7 @@ encounter.
 ## Are the run-time checks expensive?
 
 While run-time checks performed by `SendRc` and `SendOption` are certainly more expensive
-than those of `Rc` and `Option`, which are non-existrent, they are still reasonably cheap.
+than those of `Rc` and `Option`, which are non-existent, they are still reasonably cheap.
 
 `SendRc::deref()` just compares the id of the pinned-to thread fetched with a relaxed
 atomic load with the current thread, and checks that migration isn't in progress with an
