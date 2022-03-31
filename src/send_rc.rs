@@ -66,15 +66,11 @@ static NEXT_PRE_SEND_ID: AtomicU64 = AtomicU64::new(1);
 /// Reference-counting pointer like `Rc<T>`, but which is `Send` if `T` is `Send`.
 ///
 /// When created, a `SendRc` is pinned to the current thread, and is usable only in that
-/// thread. Before sending a `SendRc` to different thread, you must call
-/// [`SendRc::pre_send()`] and use the returned `PreSend` to park all the `SendRc`s that
-/// point to the same shared value with a call to [`pre_send.park()`](PreSend::park) on
-/// each. This will make the values temporarily inaccessible.
-///
-/// When done with parking, you can obtain the `post_send` token with
-/// [`pre_send.ready()`](PreSend::ready), and restore access to values in another thread
-/// by calling [`post_send.unpark()`](PostSend::unpark) there. This process may be
-/// repeated to send the `SendRc`s to another thread later.
+/// thread. Before sending it to a different thread, you must use [`SendRc::pre_send()`]
+/// to _park_ all the `SendRc`s that point to the same shared value. This will make the
+/// values temporarily inaccessible from pointers, but will allow sending them safely.
+/// When done parking, you can obtain a `PostSend` and send it to the other thread to
+/// restore access to the values there. For example:
 ///
 /// ```
 /// # use std::cell::RefCell;
@@ -101,6 +97,8 @@ static NEXT_PRE_SEND_ID: AtomicU64 = AtomicU64::new(1);
 /// .join()
 /// .unwrap();
 /// ```
+///
+/// This process may be repeated to send the `SendRc`s to another thread later.
 ///
 /// Compared to `Rc`, tradeoffs of a `SendRc` are:
 ///
@@ -138,9 +136,8 @@ impl PinError {
 impl<T> SendRc<T> {
     /// Constructs a new `SendRc<T>`.
     ///
-    /// The newly created `SendRc` is only usable from the current thread. To send it to
-    /// another thread, you must call `pre_send()`, park it, and re-enable it in the
-    /// new thread.
+    /// The `SendRc` is only usable from the current thread. To send and use it in another
+    /// thread, you must call [`pre_send()`](SendRc::pre_send).
     pub fn new(val: T) -> Self {
         let ptr = Box::into_raw(Box::new(Inner {
             pinned_to: AtomicU64::new(current_thread()),
@@ -212,25 +209,6 @@ impl<T> SendRc<T> {
             parked: Default::default(),
             pre_send_id: NEXT_PRE_SEND_ID.fetch_add(1, Ordering::Relaxed),
         }
-    }
-
-    /// Prepare to send a collection of `SendRc`s to a different thread.
-    ///
-    /// Calls `SendRc::pre_send()`, parks the provided `SendRc`s, and finally returns the
-    /// post-send token returned by `pre_send.ready()`. Useful for one-shot move of
-    /// `SendRc`s which are easily traversable.
-    ///
-    /// Panics if there exists a `SendRc`s not included in `all` that points to the same
-    /// value as a `SendRc` in `all`.
-    pub fn pre_send_ready<'a>(all: impl IntoIterator<Item = &'a mut Self>) -> PostSend<T>
-    where
-        T: 'a,
-    {
-        let pre_send = Self::pre_send();
-        for send_rc in all {
-            pre_send.park(send_rc);
-        }
-        pre_send.ready()
     }
 
     /// Returns the number of `SendRc`s pointing to the value.
@@ -637,8 +615,10 @@ mod tests {
     fn ok_send() {
         let mut r1 = SendRc::new(RefCell::new(1));
         let mut r2 = SendRc::clone(&r1);
-        let post_send = SendRc::pre_send_ready([&mut r1, &mut r2]);
-
+        let pre_send = SendRc::pre_send();
+        pre_send.park(&mut r1);
+        pre_send.park(&mut r2);
+        let post_send = pre_send.ready();
         std::thread::spawn(move || {
             post_send.unpark();
             *r1.borrow_mut() += 1;
