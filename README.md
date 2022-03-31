@@ -1,12 +1,14 @@
 # sendable
 
-The `sendable` crate defines types to facilitate sending data between threads:
+The `sendable` crate defines types to facilitate sending interconnected data between
+threads:
 
 * `SendRc`, a single-threaded reference-counting pointer that can be sent between
   threads. You can think of it as a variant of `Rc<T>` that is `Send` if `T` is
   `Send`. This is unlike `Rc<T>` which is never `Send`, and also unlike `Arc<T>`, which
   requires `T: Send + Sync` to be `Send`.
-* `SendOption`, which holds an `Option<T>` and is `Send` even if `T` is not `Send`.
+* `SendOption`, which holds an `Option<T>` and is `Send` even if `T` is not `Send`. It is
+  useful for store reference to a single-threaded arena which is sent separately.
 
 ## When is SendRc useful?
 
@@ -33,17 +35,17 @@ shared data remained in the original thread, unsynchronized access to the non-`S
 and unsynchronized manipulation of the reference counts would be undefined behavior and
 wreak havoc.
 
-If there were a way to demonstrate to Rust that you've sent all pointers to a particular
-shared value to a different thread, there would be no problem in sending `Rc<T>` across
-thread boundary, as long as `T` itself is `Send`. That demonstration is exactly what
-`SendRc` brings to the table.
+If there were a way to demonstrate to Rust that you've sent all `Rc<T>` pointers to a
+particular shared value to a different thread, there would be no problem in doing so, as
+long as `T` itself is `Send`. Ability to perform that demonstration is what `SendRc`
+brings to the table.
 
 ## How does SendRc work?
 
-When a `SendRc` is constructed, it stores the current thread id next to the value and the
-reference count. On access to the value, and before manipulating the reference count
-through `clone()` and `drop()`, it checks that the `SendRc` is still in the thread it was
-created in.
+When a `SendRc` is constructed, it stores the id of the current thread next to the value
+and the reference count. Before giving access to the value, and before manipulating the
+reference count through `clone()` and `drop()`, it checks that the thread is still the
+same thread, and panics otherwise.
 
 Before `SendRc`s are moved to a different thread, each pointer is explicitly "parked",
 i.e. registered for sending. Once parked, access to the value it points to is prohibited,
@@ -65,7 +67,7 @@ let post_send = pre_send.ready();
 
 // move everything to a different thread
 std::thread::spawn(move || {
-    // both pointers are unusable here
+    // in this thread, SendRcs are unusable until unparked
     post_send.unpark();
     // they're again usable from this point, but only in this thread
     *r1.borrow_mut() += 1;

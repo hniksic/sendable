@@ -92,7 +92,7 @@ static NEXT_PRE_SEND_ID: AtomicU64 = AtomicU64::new(1);
 ///
 /// // move everything to a different thread
 /// std::thread::spawn(move || {
-///     // both pointers are unusable here
+///     // in this thread, SendRcs are unusable until unparked
 ///     post_send.unpark();
 ///     // they're again usable from this point, but only in this thread
 ///     *r1.borrow_mut() += 1;
