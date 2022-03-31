@@ -6,7 +6,7 @@ where
     T: deepsize::DeepSizeOf,
 {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        (&**self).deep_size_of_children(context)
+        (**self).deep_size_of_children(context)
     }
 }
 
@@ -15,6 +15,6 @@ where
     T: deepsize::DeepSizeOf,
 {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        (&**self).deep_size_of_children(context)
+        (**self).deep_size_of_children(context)
     }
 }
