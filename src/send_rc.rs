@@ -225,8 +225,7 @@ impl<T> SendRc<T> {
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
         this.assert_pinned("SendRc::try_unwrap()");
         if this.inner().strong_count.get() == 1 {
-            // Safety: refcount is 1, so it's just us, and the pointer was obtained using
-            // Box::into_raw().
+            // Safety: refcnt == 1, so it's just us
             let inner_box = unsafe { Box::from_raw(this.ptr.as_ptr()) };
             Ok(inner_box.val)
         } else {
@@ -242,7 +241,8 @@ impl<T> SendRc<T> {
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
         this.assert_pinned("SendRc::get_mut()");
         if this.inner().strong_count.get() == 1 {
-            // Safety: we've checked that refcount is 1
+            // Safety: we've checked that refcnt == 1, and it can't increase because
+            // this.clone() doesn't compile while the returned &mut T is live.
             unsafe { Some(&mut this.inner_mut().val) }
         } else {
             None
@@ -501,9 +501,10 @@ impl<T> Drop for SendRc<T> {
         // the pin is ok - proceed with the drop
         let refcnt = self.inner().strong_count.get();
         if refcnt == 1 {
-            // safety: refcnt == 1, time to die
+            // safety: dropping Rc with refcnt == 1, it's just us
             unsafe {
-                std::ptr::drop_in_place(self.ptr.as_ptr());
+                let inner_box = Box::from_raw(self.ptr.as_ptr());
+                drop(inner_box); // drops the value and deallocates the Box
             }
         } else {
             self.inner().strong_count.set(refcnt - 1);
