@@ -574,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drop() {
+    fn drops() {
         struct Payload(Rc<RefCell<bool>>);
         impl Drop for Payload {
             fn drop(&mut self) {

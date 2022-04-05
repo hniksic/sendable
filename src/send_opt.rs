@@ -115,17 +115,37 @@ impl<T: Debug> Debug for SendOption<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
+    use std::{rc::Rc, cell::RefCell};
 
     use super::SendOption;
 
+    // create a custom non-send type instead of just using Rc<u32> so miri doesn't
+    // complain of leaks when we don't drop it
+    #[derive(Default, Eq, PartialEq, Debug)]
+    struct NonSend(Option<Rc<u32>>);
+
     #[test]
     fn trivial() {
-        let mut o = SendOption::new(Some(Rc::new(0)));
-        assert_eq!(o.as_deref(), Some(&0));
+        let mut o = SendOption::new(Some(NonSend::default()));
+        assert_eq!(&*o, &Some(NonSend::default()));
         *o = None;
         assert_eq!(o.as_ref(), None);
-        *o = Some(Rc::new(0));
+        *o = Some(NonSend::default());
+    }
+
+    #[test]
+    fn drops() {
+        struct Payload(Rc<RefCell<bool>>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                *self.0.as_ref().borrow_mut() = true;
+            }
+        }
+        let is_dropped = Rc::new(RefCell::new(false));
+        let o = SendOption::new(Some(Payload(Rc::clone(&is_dropped))));
+        assert!(!*is_dropped.borrow());
+        drop(o);
+        assert!(*is_dropped.borrow());
     }
 
     #[test]
@@ -143,7 +163,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn bad_deref_some() {
-        let o = SendOption::new(Some(Rc::new(0)));
+        let o = SendOption::new(Some(NonSend::default()));
         std::thread::spawn(move || {
             let _ = &*o;
         })
@@ -165,7 +185,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn bad_deref_mut() {
-        let mut o = SendOption::new(Some(Rc::new(0)));
+        let mut o = SendOption::new(Some(NonSend::default()));
         std::thread::spawn(move || {
             let _ = &mut *o;
         })
@@ -176,7 +196,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn bad_drop() {
-        let o = SendOption::new(Some(Rc::new(0)));
+        let o = SendOption::new(Some(NonSend::default()));
         std::thread::spawn(move || {
             drop(o);
         })
@@ -186,10 +206,10 @@ mod tests {
 
     #[test]
     fn good_send() {
-        let mut o: SendOption<Rc<u32>> = SendOption::default();
+        let mut o: SendOption<NonSend> = SendOption::default();
         std::thread::spawn(move || {
             o.post_send();
-            *o = Some(Rc::new(1));
+            *o = Some(NonSend::default());
         })
         .join()
         .unwrap();
@@ -198,10 +218,10 @@ mod tests {
     #[test]
     #[should_panic]
     fn send_and_return_bad1() {
-        let mut o: SendOption<Rc<u32>> = SendOption::default();
+        let mut o: SendOption<NonSend> = SendOption::default();
         let o = std::thread::spawn(move || {
             o.post_send();
-            *o = Some(Rc::new(1));
+            *o = Some(NonSend::default());
             o
         })
         .join()
@@ -212,10 +232,10 @@ mod tests {
     #[test]
     #[should_panic]
     fn send_and_return_bad2() {
-        let mut o: SendOption<Rc<u32>> = SendOption::default();
+        let mut o: SendOption<NonSend> = SendOption::default();
         let mut o = std::thread::spawn(move || {
             o.post_send();
-            *o = Some(Rc::new(1));
+            *o = Some(NonSend::default());
             o
         })
         .join()
@@ -225,10 +245,10 @@ mod tests {
 
     #[test]
     fn send_and_return_good() {
-        let mut o: SendOption<Rc<u32>> = SendOption::default();
+        let mut o: SendOption<NonSend> = SendOption::default();
         let mut o = std::thread::spawn(move || {
             o.post_send();
-            *o = Some(Rc::new(1));
+            *o = Some(NonSend::default());
             *o = None;
             o
         })
