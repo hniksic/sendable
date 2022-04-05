@@ -147,12 +147,17 @@ that refers to a single-threaded arena.
 
 ## Is this really safe?
 
-As with any crate that contains unsafe code, one can never be 100% certain that there is
-no soundness issue. The code is fairly straightforward in implementing the design outlined
-above. I went through several iterations of the design and the implementation before
-settling on the current approach and, while I did find the occasional issue, the
-underlying idea held up under scrutiny. MIRI finds no undefined behavior while running the
-tests.
+`sendable` adheres to Rust safety guarantees. In particular, it should never be possible
+to cause undefined behavior with safe code. Failure to abide by the rules that cannot be
+caught at compile time, e.g. by sending a `SendRc` to another thread and attempting to use
+it without the park/unpark procedure, is detected at run time and met with panic.
+
+As with any crate that uses unsafe code, the compiler cannot statically verify that there
+is no soundness issue. However, the code is fairly straightforward in implementing the
+design outlined above, and every usage of unsafe is carefully documented. I went through
+several iterations of the design and the implementation before settling on the current
+approach and, while I did find the occasional issue, the underlying idea held up under
+scrutiny. MIRI finds no undefined behavior while running the tests.
 
 You are invited to review the code - it is not large - and report any issues you
 encounter.
