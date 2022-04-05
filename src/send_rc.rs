@@ -352,7 +352,7 @@ impl<T> PreSend<T> {
     /// assert!(!pre_send.is_ready()); // r1/r2 ok, but q2 unparked
     /// pre_send.park(&mut q2);
     /// assert!(pre_send.is_ready());  // both r1/r2 and q1/q2 shared values fully parked
-    /// # std::mem::forget([r1, r2, q1, q2]);
+    /// # pre_send.ready().unpark();
     /// ```
     pub fn is_ready(&self) -> bool {
         // Count how many `SendRc`s point to each shared value.
@@ -392,7 +392,8 @@ impl<T> PreSend<T> {
     /// assert!(!pre_send.park_status_of(&r2).sendrc_parked); // r2 is not yet parked
     /// assert!(pre_send.park_status_of(&r1).value_parked);   // the underlying value is parked
     /// assert!(pre_send.park_status_of(&r2).value_parked);   // the underlying value is parked
-    /// # std::mem::forget([r1, r2]);
+    /// # pre_send.park(&mut r2);
+    /// # pre_send.ready().unpark();
     /// ```
     ///
     /// Panics when invoked from a different thread than the one the `SendRc` was created
@@ -703,12 +704,13 @@ mod tests {
         let _ref1: &RefCell<u32> = pre_send2.park(&mut r1); // this must panic
         let post_send = pre_send1.ready();
         // if the above didn't panic, the code below would run and be UB
-        std::thread::spawn(move || {
+        let t = std::thread::spawn(move || {
             post_send.unpark();
             let _ref2: &RefCell<u32> = &*r2;
             //*ref2.borrow_mut() += 1; // data race with ref1
         });
         //*ref1.borrow_mut() += 1; // data race with ref2
+        t.join().unwrap();
     }
 
     #[test]
@@ -719,9 +721,8 @@ mod tests {
         pre_send.park(&mut r1);
         pre_send.park(&mut r1);
         pre_send.park(&mut r2);
-        let _ = pre_send.ready();
-        // avoid panic on drop
-        std::mem::forget([r1, r2]);
+        let post_send = pre_send.ready();
+        post_send.unpark();
     }
 
     #[test]
