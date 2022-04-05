@@ -504,8 +504,12 @@ impl<T> Drop for SendRc<T> {
         if refcnt == 1 {
             // safety: dropping Rc with refcnt == 1, it's just us
             unsafe {
+                // Dropping the Box drops the value and deallocates the heap storage.
+                // Weak refs would require separating them by wrapping the value in
+                // ManuallyDrop<T> and calling `inner().val.drop()` here. Dropping the box
+                // would be done only once the weak count drops to 0.
                 let inner_box = Box::from_raw(self.ptr.as_ptr());
-                drop(inner_box); // drops the value and deallocates the Box
+                drop(inner_box);
             }
         } else {
             self.inner().strong_count.set(refcnt - 1);
