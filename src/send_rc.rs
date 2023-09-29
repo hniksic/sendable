@@ -752,4 +752,62 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(*state.lock().unwrap(), 3);
     }
+
+
+    #[derive(Default, Debug, Eq, PartialEq)]
+    struct ComplexValueToBeDropped {
+    }
+
+    impl Drop for ComplexValueToBeDropped{
+        fn drop(&mut self) {
+            println!("Dropping complex value");
+        }
+    }
+
+    #[derive(Default, Debug, Eq, PartialEq)]
+    struct StructContainingReferenceToComplexValueToBeDropped {
+        reference_to_complex_value_to_be_dropped:  SendRc<RefCell<ComplexValueToBeDropped>>
+    }
+
+    impl Drop for StructContainingReferenceToComplexValueToBeDropped{
+        fn drop(&mut self) {
+            println!("Dropping struct containing reference to complex value");
+        }
+    }
+
+
+    #[test]
+    fn test_send_rc_drop() {
+
+        // create two SendRcs pointing to a shared value
+        let mut r1: SendRc<RefCell<ComplexValueToBeDropped>> = SendRc::new(RefCell::new(ComplexValueToBeDropped::default()));
+        let mut r2 = SendRc::clone(&r1);
+
+// prepare to send them to a different thread
+        let pre_send = SendRc::pre_send();
+        pre_send.park(&mut r1); // r1 and r2 cannot be dereferenced from this point
+        pre_send.park(&mut r2);
+// ready() would panic if there were unparked SendRcs pointing to the value
+        let post_send = pre_send.ready();
+
+        let parent_struct = StructContainingReferenceToComplexValueToBeDropped {
+            reference_to_complex_value_to_be_dropped: r1
+        };
+
+// move everything to a different thread
+        let jh = std::thread::spawn(move || {
+            // SendRcs are still unusable until unparked
+            post_send.unpark();
+            // they're again usable from this point, and only in this thread
+            assert_eq!(*r2.borrow(), ComplexValueToBeDropped::default());
+        });
+
+        let jh2 = std::thread::spawn(move || {
+            // SendRcs are still unusable until unparked
+            println!("{:?}",parent_struct)
+        });
+
+        jh.join().unwrap();
+        jh2.join().unwrap();
+    }
 }
