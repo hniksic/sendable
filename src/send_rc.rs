@@ -775,7 +775,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn test_send_rc_drop() {
 
