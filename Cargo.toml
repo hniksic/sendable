@@ -1,6 +1,6 @@
 [package]
 name = "sendable"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 authors = ["Hrvoje Nikšić <hniksic@gmail.com>"]
 license = "Apache-2.0/MIT"
