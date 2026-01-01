@@ -26,12 +26,14 @@ mod tests {
     fn various() {
         let id0 = current_thread();
         assert_eq!(id0, current_thread());
-        let threads = (0..100).map(|_| {
-            std::thread::spawn(|| {
-                let id = current_thread();
-                assert_eq!(id, current_thread());
-                id
-            })})
+        let threads = (0..100)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let id = current_thread();
+                    assert_eq!(id, current_thread());
+                    id
+                })
+            })
             .collect::<Vec<_>>();
         let mut ids = HashSet::from([id0]);
         ids.extend(threads.into_iter().map(|thr| thr.join().unwrap()));

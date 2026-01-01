@@ -96,7 +96,7 @@ impl<T> Drop for SendOption<T> {
 
 impl<T: Clone> Clone for SendOption<T> {
     fn clone(&self) -> Self {
-        SendOption::new((&**self).clone())
+        SendOption::new((**self).clone())
     }
 }
 
@@ -108,14 +108,14 @@ impl<T> Default for SendOption<T> {
 
 impl<T: Debug> Debug for SendOption<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let opt: &Option<T> = &**self;
+        let opt: &Option<T> = self;
         f.debug_tuple("SendOption").field(opt).finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{rc::Rc, cell::RefCell};
+    use std::{cell::RefCell, rc::Rc};
 
     use super::SendOption;
 

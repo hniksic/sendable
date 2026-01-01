@@ -102,7 +102,7 @@ static NEXT_PRE_SEND_ID: AtomicU64 = AtomicU64::new(1);
 /// Compared to `Rc`, tradeoffs of a `SendRc` are:
 ///
 /// * `deref()`, `clone()`, and `drop()` require a check that the shared value is not
-///    parked, and a check that we're accessing it from the correct thread.
+///   parked, and a check that we're accessing it from the correct thread.
 /// * a `SendRc` takes up two machine words.
 /// * it currently doesn't support weak pointers.
 pub struct SendRc<T> {
@@ -163,7 +163,7 @@ impl<T> SendRc<T> {
 
     // Safety: requires reference count of 1
     unsafe fn inner_mut(&mut self) -> &mut Inner<T> {
-        self.ptr.as_mut()
+        unsafe { self.ptr.as_mut() }
     }
 
     #[inline]
@@ -519,13 +519,13 @@ impl<T> Drop for SendRc<T> {
 
 impl<T> AsRef<T> for SendRc<T> {
     fn as_ref(&self) -> &T {
-        &**self
+        self
     }
 }
 
 impl<T> Borrow<T> for SendRc<T> {
     fn borrow(&self) -> &T {
-        &**self
+        self
     }
 }
 

@@ -1,4 +1,4 @@
-///! Optional support for the deepsize crate.
+//! Optional support for the deepsize crate.
 use crate::{SendOption, SendRc};
 
 impl<T> deepsize::DeepSizeOf for SendRc<T>
