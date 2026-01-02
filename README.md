@@ -8,7 +8,7 @@ threads:
   `Send`. This is unlike `Rc<T>` which is never `Send`, and also unlike `Arc<T>`, which
   requires `T: Send + Sync` to be `Send`.
 * `SendOption`, which holds an `Option<T>` and is `Send` even if `T` is not `Send`. It is
-  useful for store reference to a single-threaded arena which is sent separately.
+  useful for storing a reference to a single-threaded arena which is sent separately.
 
 ## When is SendRc useful?
 
