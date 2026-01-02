@@ -225,8 +225,10 @@ impl<T> SendRc<T> {
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
         this.assert_pinned("SendRc::try_unwrap()");
         if this.inner().strong_count.get() == 1 {
-            // Safety: refcnt == 1, so it's just us
+            // Safety: refcnt == 1, so it's just us. We must forget `this` to prevent
+            // its destructor from running after we've deallocated the inner box.
             let inner_box = unsafe { Box::from_raw(this.ptr.as_ptr()) };
+            std::mem::forget(this);
             Ok(inner_box.val)
         } else {
             Err(this)
@@ -751,5 +753,20 @@ mod tests {
         .join();
         assert!(result.is_err());
         assert_eq!(*state.lock().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_try_unwrap_success() {
+        let r = SendRc::new(RefCell::new(42));
+        let val = SendRc::try_unwrap(r).unwrap();
+        assert_eq!(*val.borrow(), 42);
+    }
+
+    #[test]
+    fn test_try_unwrap_failure() {
+        let r1 = SendRc::new(RefCell::new(42));
+        let r2 = SendRc::clone(&r1);
+        assert!(SendRc::try_unwrap(r1).is_err());
+        drop(r2);
     }
 }
