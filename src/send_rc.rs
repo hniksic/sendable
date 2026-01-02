@@ -769,4 +769,34 @@ mod tests {
         assert!(SendRc::try_unwrap(r1).is_err());
         drop(r2);
     }
+
+    #[test]
+    #[should_panic = "SendRc accessed from wrong thread"]
+    fn clones_sent_to_different_threads() {
+        // Sending clones to different threads is not allowed - all clones
+        // must go to the same thread.
+        let mut r1 = SendRc::new(RefCell::new(1));
+        let mut r2 = SendRc::clone(&r1);
+
+        let pre_send = SendRc::pre_send();
+        pre_send.park(&mut r1);
+        pre_send.park(&mut r2);
+        let post_send = pre_send.ready();
+
+        // Send r1 and post_send to thread 1
+        let jh1 = std::thread::spawn(move || {
+            post_send.unpark();
+            drop(r1);
+        });
+
+        // Send r2 to thread 2 - this is incorrect usage
+        let jh2 = std::thread::spawn(move || {
+            drop(r2); // will panic: wrong thread
+        });
+
+        jh1.join().unwrap();
+        jh2.join()
+            .map_err(|e| std::panic::resume_unwind(e))
+            .unwrap();
+    }
 }
